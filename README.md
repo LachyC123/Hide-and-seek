@@ -22,16 +22,99 @@ Supabase project for this — plain REST calls, no SDK, still one static file.
 **You only do this once.** After that the join link carries the connection, so nobody else has
 to set anything up.
 
-1. Create a free project at [supabase.com](https://supabase.com).
-2. SQL editor → paste and run the block shown on the game's **Multiplayer setup** screen. It
-   creates two tables, makes them unreachable from a browser, and exposes a handful of stored
-   functions that each require a room code. Safe to re-run.
-3. Project settings → API. Copy the **project URL** and the **anon public** key.
-   Never the `service_role` key — that one bypasses everything.
-4. In the game: home screen → **Multiplayer setup** → paste both → *Save & test connection*.
-   That does a real write-and-read round trip and tells you exactly what is wrong if anything is.
-5. Create a game. The lobby shows a **join link** — send that to everyone. Opening it connects
-   their phone and drops them straight into your lobby.
+1. **Make a project.** [supabase.com](https://supabase.com) → sign in with GitHub → *New project*.
+   Any name, any nearby region, free plan. Wait a minute or two while it builds.
+2. **Make the tables.** Left sidebar → **SQL Editor** → *New query*. Paste the block below and
+   press **Run**. "Success. No rows returned" is what success looks like. Safe to re-run.
+3. **Copy two values.** Left sidebar → **Project Settings** → **API**. You want the **Project
+   URL** and the key labelled **anon / public** (newer projects say **publishable**).
+   Never the one marked `service_role` or `secret` — that is a master key and must not go in a
+   game or a link. If you paste it by mistake, reset it in Supabase.
+4. **Paste them in.** In the game: home screen → **Multiplayer setup** → both boxes →
+   *Save & test connection*. That does a real write-and-read against your project and tells you
+   exactly what is wrong if anything is.
+5. **Play.** Create a game. The lobby shows a **join link** — send it to everyone. Opening it
+   sets their phone up automatically, so you are the only person who ever sees the setup screen.
+
+<details>
+<summary>The SQL for step 2</summary>
+
+```sql
+create table if not exists fs_rooms (
+  code text primary key,
+  state jsonb not null,
+  updated_at timestamptz not null default now());
+
+create table if not exists fs_inputs (
+  code text not null,
+  player_id text not null,
+  input jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (code, player_id));
+
+create index if not exists fs_rooms_updated  on fs_rooms(updated_at);
+create index if not exists fs_inputs_updated on fs_inputs(updated_at);
+
+-- The tables are not reachable from a browser at all. Everything goes through the
+-- functions below, and every one of them demands the room code. Nobody can list
+-- rooms or read a match they were not invited to.
+drop policy if exists fs_rooms_all  on fs_rooms;
+drop policy if exists fs_inputs_all on fs_inputs;
+alter table fs_rooms  enable row level security;
+alter table fs_inputs enable row level security;
+revoke all on fs_rooms  from anon, authenticated;
+revoke all on fs_inputs from anon, authenticated;
+
+create or replace function fs_put_room(p_code text, p_state jsonb) returns void
+language sql security definer set search_path = public as $$
+  insert into fs_rooms(code, state, updated_at) values (upper(p_code), p_state, now())
+  on conflict (code) do update set state = excluded.state, updated_at = now();
+$$;
+
+create or replace function fs_get_room(p_code text) returns jsonb
+language sql security definer set search_path = public as $$
+  select state from fs_rooms where code = upper(p_code);
+$$;
+
+create or replace function fs_drop_room(p_code text) returns void
+language sql security definer set search_path = public as $$
+  delete from fs_inputs where code = upper(p_code);
+  delete from fs_rooms  where code = upper(p_code);
+$$;
+
+create or replace function fs_put_input(p_code text, p_player text, p_input jsonb) returns void
+language sql security definer set search_path = public as $$
+  insert into fs_inputs(code, player_id, input, updated_at)
+  values (upper(p_code), p_player, p_input, now())
+  on conflict (code, player_id) do update set input = excluded.input, updated_at = now();
+$$;
+
+create or replace function fs_list_inputs(p_code text) returns jsonb
+language sql security definer set search_path = public as $$
+  select coalesce(jsonb_agg(input), '[]'::jsonb) from fs_inputs where code = upper(p_code);
+$$;
+
+create or replace function fs_clear_inputs(p_code text) returns void
+language sql security definer set search_path = public as $$
+  delete from fs_inputs where code = upper(p_code);
+$$;
+
+create or replace function fs_drop_input(p_code text, p_player text) returns void
+language sql security definer set search_path = public as $$
+  delete from fs_inputs where code = upper(p_code) and player_id = p_player;
+$$;
+
+grant execute on function
+  fs_put_room(text, jsonb), fs_get_room(text), fs_drop_room(text),
+  fs_put_input(text, text, jsonb), fs_list_inputs(text),
+  fs_clear_inputs(text), fs_drop_input(text, text)
+to anon;
+```
+
+This is the same text the game shows on its Multiplayer setup screen — it lives in `MP_SQL` in
+`src/game.js`, and a harness test fails if the client ever calls a function this block does not
+create and grant.
+</details>
 
 To skip step 4 for everybody forever, put the same two values in `MP_DEFAULT` at the top of
 `src/game.js` and rebuild. Then the deployed link is already connected and players only ever

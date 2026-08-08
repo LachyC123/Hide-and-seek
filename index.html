@@ -319,23 +319,47 @@ input:focus{outline:none;border-color:var(--accent)}
       <div class="tiny">Status</div>
       <p id="mpStatus" style="margin:6px 0 0;font-size:12px">—</p>
     </div>
+
+    <div class="panel" style="margin-top:12px">
+      <div class="tiny">Step 1 — make a project</div>
+      <p style="margin:6px 0 0;font-size:12px">Go to <b>supabase.com</b>, sign in with GitHub and
+      make a new project. Any name, any region near you. It takes a minute or two to finish
+      building. The free plan is plenty.</p>
+    </div>
+
+    <div class="panel">
+      <div class="tiny">Step 2 — make the tables</div>
+      <p style="margin:6px 0 0;font-size:12px">In your project, click <b>SQL Editor</b> in the left
+      sidebar, then <b>New query</b>. Copy everything in the black box below, paste it in, and press
+      <b>Run</b>. You should see “Success. No rows returned” — that is what success looks like here.</p>
+      <pre id="mpSql" class="sqlbox"></pre>
+    </div>
+
+    <div class="panel">
+      <div class="tiny">Step 3 — copy your two values</div>
+      <p style="margin:6px 0 0;font-size:12px">Left sidebar → <b>Project Settings</b> → <b>API</b>.
+      You need the <b>Project URL</b>, and the key labelled <b>anon</b> / <b>public</b> (newer
+      projects may call it <b>publishable</b>). Paste both below.</p>
+      <p style="margin:8px 0 0;font-size:12px;color:var(--ember)"><b>Not</b> the one marked
+      <b>service_role</b> or <b>secret</b>. That one is a master key — it must never go in a game
+      or a link. If you paste it by mistake, reset it in Supabase.</p>
+    </div>
+
     <div style="margin-top:12px">
       <div class="tiny">Project URL</div>
       <input id="mpUrl" placeholder="https://abcdefgh.supabase.co" autocomplete="off" spellcheck="false">
-      <div class="tiny" style="margin-top:10px">Anon public key</div>
+      <div class="tiny" style="margin-top:10px">Anon / public key</div>
       <input id="mpKey" placeholder="eyJhbGciOi…" autocomplete="off" spellcheck="false">
       <p id="mpMsg" class="tiny" style="min-height:16px;text-align:center;color:var(--ember)"></p>
       <button class="btn" id="b-mp-save">Save &amp; test connection</button>
       <button class="btn ghost small" id="b-mp-clear">Forget these details</button>
     </div>
+
     <div class="panel" style="margin-top:12px">
-      <div class="tiny">Step 1 — make the tables</div>
-      <p style="margin:6px 0 0;font-size:12px">Supabase → SQL editor → paste and run:</p>
-      <pre id="mpSql" class="sqlbox"></pre>
-      <div class="tiny" style="margin-top:10px">Step 2 — copy the keys</div>
-      <p style="margin:6px 0 0;font-size:12px">Supabase → Project settings → API. Copy the project
-      URL and the <b>anon public</b> key into the boxes above. The anon key is meant to be public —
-      it is safe in a link.</p>
+      <div class="tiny">Then what?</div>
+      <p style="margin:6px 0 0;font-size:12px">Nothing. Create a game as normal — the lobby will
+      show a <b>join link</b>. Send that to everyone playing. Opening it sets their phone up
+      automatically, so you are the only person who ever sees this screen.</p>
     </div>
     <div class="spacer"></div>
     <button class="btn ghost small" data-back="s-home">Back</button>
