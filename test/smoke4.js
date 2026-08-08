@@ -1,6 +1,6 @@
 const fs=require('fs');const {JSDOM}=require('jsdom');const stubAll=require('./_stub');
 const html=fs.readFileSync(require('path').join(__dirname,'..','index.html'),'utf8');
-const errors=[];const dom=new JSDOM(html,{runScripts:'dangerously',pretendToBeVisual:true,url:'https://example.com/',beforeParse:stubAll});
+const errors=[];const dom=new JSDOM(html,{runScripts:'dangerously',pretendToBeVisual:true,url:'https://example.com/#dev',beforeParse:stubAll});
 const w=dom.window;w.addEventListener('error',e=>errors.push(e.message));
 const stub=new Proxy({},{get:(t,k)=>k==='measureText'?(()=>({width:20})):(()=>{})});
 w.HTMLCanvasElement.prototype.getContext=()=>stub;w.requestAnimationFrame=()=>0;

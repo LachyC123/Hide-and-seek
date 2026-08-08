@@ -96,7 +96,7 @@ function makeStore(){
 const errors=[];
 function makeWindow(tag,hash,store){
   const dom=new JSDOM(html,{runScripts:'dangerously',pretendToBeVisual:true,
-    url:'https://example.com/'+hash,
+    url:'https://example.com/'+hash+'&dev=1',
     beforeParse(w){
       stubAll(w);
       const stubCtx=new Proxy({},{get:(t,k)=>k==='measureText'?(()=>({width:20}))

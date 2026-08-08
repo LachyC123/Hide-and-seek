@@ -125,7 +125,7 @@ can join.
 ```bash
 npm install
 npm run serve     # http://localhost:8080 — GPS works on localhost
-npm test          # 301 logic tests + 7 browser-simulated runs
+npm test          # 303 logic tests + 7 browser-simulated runs
 ```
 
 `test/smoke7.js` is worth knowing about: it boots the real built file in two windows against a
@@ -141,8 +141,16 @@ STAND STILL screen and nothing moves — for road crossings and toilet breaks) o
 and go straight to results. If the host's phone dies, the other phones notice and one of them
 takes the match over.
 
-Home screen → **Solo test run** spawns five bots. The green **DEV** tab on the right edge jumps
-phases, forces any of the three victories, triggers votes, moves the zone and fakes catches.
+Home screen → **Solo test run** spawns five bots.
+
+The **DEV** panel — jump phases, force any of the three victories, trigger votes, move the zone,
+fake catches, drop a player, inspect the network — is hidden from players. Add `#dev` to the URL
+to bring it back:
+
+```
+https://<you>.github.io/<repo>/#dev
+```
+
 **Map & GPS check** on the home screen tells you exactly what your browser is and isn't allowing.
 
 ## Notes for Claude Code

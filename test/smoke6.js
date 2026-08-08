@@ -106,6 +106,10 @@ setTimeout(()=>{
     if(link.length>120) errs.push('join link is too long to scan: '+link.length+' chars');
     if(q2('#lobbyQRWrap').classList.contains('hidden'))
       errs.push('no QR code was drawn for a short join link');
+    // a player must never be able to jump the clock or force a win from the match screen
+    if(q2('#devtab').style.display!=='none')
+      errs.push('the dev panel is visible to an ordinary player');
+    console.log('  · dev panel hidden for players: '+(q2('#devtab').style.display==='none'));
     console.log('\nFALSE SAFE — the shipped build is pre-connected');
     console.log('─'.repeat(38));
     console.log('  · create game went straight to: '+shipped);

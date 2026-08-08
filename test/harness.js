@@ -877,6 +877,10 @@ t('a lowercase code typed into a link still finds the room',()=>
 t('a garbled hash is ignored rather than crashing the boot',()=>{
   const h=C.parseHash('#mp=notaconfig&room=');
   return ok(h.code===null&&h.mp===null);});
+t('the dev panel is off unless the link asks for it',()=>
+  ok(!C.parseHash('#room=ABCDE').dev&&!C.parseHash('').dev&&!C.parseHash('#dev=0').dev));
+t('the dev panel can still be summoned for testing',()=>
+  ok(C.parseHash('#dev').dev&&C.parseHash('#dev=1').dev&&C.parseHash('#room=ABCDE&dev=1').dev));
 t('an empty hash means a normal cold start',()=>{
   const h=C.parseHash('');
   return ok(h.code===null&&h.mp===null);});

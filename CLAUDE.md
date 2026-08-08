@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  301 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  303 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -52,7 +52,9 @@ test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
 5. **No `localStorage` / `sessionStorage`.** Persistence goes through `window.storage` when
    present, and every call is wrapped so the game still runs when it isn't.
 6. Prefer adding to the DEV panel over adding temporary debug UI. It already covers every
-   phase jump, forced win, catch, vote and zone move.
+   phase jump, forced win, catch, vote and zone move. It is hidden unless the URL carries
+   `#dev`, so the smoke tests that drive the game through it load the page with that flag —
+   smoke5 and smoke6 deliberately do not, because they check what a player actually sees.
 
 ## Invariants the tests protect
 
@@ -191,7 +193,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           301 core tests + 7 smoke runs
+npm test           303 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

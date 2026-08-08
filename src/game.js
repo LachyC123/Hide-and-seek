@@ -593,10 +593,15 @@ function parseHash(hash){
   var out={}, s=String(hash||'');
   if(s.indexOf('#')>=0) s=s.slice(s.indexOf('#')+1);   // accepts a bare hash or a whole URL
   s.split('&').forEach(function(kv){
-    var i=kv.indexOf('='); if(i>0) out[kv.slice(0,i)]=kv.slice(i+1);
+    if(!kv) return;
+    var i=kv.indexOf('=');
+    if(i>0) out[kv.slice(0,i)]=kv.slice(i+1);
+    else if(i<0) out[kv]='';            // a bare flag, as in #dev
   });
   var code=(out.room||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
-  return {code:code||null,mp:decodeMpConfig(out.mp)};
+  // the dev panel is opt-in: players should never see it, but testing needs a way in
+  var dev=Object.prototype.hasOwnProperty.call(out,'dev')&&out.dev!=='0';
+  return {code:code||null,mp:decodeMpConfig(out.mp),dev:dev};
 }
 /* The connection is ~260 characters and dwarfs everything else in the link. When the
    page already carries it in the build, leaving it out turns a link nobody can scan
@@ -3467,6 +3472,14 @@ function boot(){
   // a join link carries the room and the connection, so a guest taps once and is in
   var H=parseHash(location.hash);
   if(H.mp) G.mp=H.mp;
+  // The green DEV tab is a development tool, not part of the game. It appears only when
+  // the URL asks for it (#dev), so nobody in a real match can jump the clock or force a win.
+  G.dev=!!H.dev;
+  if(!G.dev){
+    var dt=$('#devtab'), dp=$('#dev');
+    if(dt) dt.style.display='none';
+    if(dp) dp.style.display='none';
+  }
   initMap(); buildDev(); buildHowTo();
   startGPS();
   loadProfile().then(function(p){
