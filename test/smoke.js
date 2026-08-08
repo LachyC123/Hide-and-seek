@@ -55,6 +55,28 @@ setTimeout(()=>{
               try{byLabel(seq[i]).click();log.push('dev: '+seq[i]);}catch(e){errors.push(seq[i]+' -> '+e.message);}
               i++;setTimeout(run,320);
             } else {
+              // The fallback catch has to work when GPS will not: a seeker names who they
+              // tagged and that player is out, no distance check involved.
+              try{
+                byLabel('make me seeker').click();
+                const before=(/uncaught (\d+)/.exec(D.querySelector('#devlog').textContent)||[0,0])[1];
+                setTimeout(()=>{
+                  const mb=D.querySelector('#manualbtn');
+                  if(mb.classList.contains('hidden')) errors.push('a seeker was offered no manual catch');
+                  mb.click();
+                  const opts=[...D.querySelectorAll('.modal button')];
+                  log.push('manual catch offered '+(opts.length-1)+' names');
+                  if(opts.length<2) errors.push('manual catch listed nobody');
+                  else opts[0].click();
+                  setTimeout(()=>{
+                    const after=(/uncaught (\d+)/.exec(D.querySelector('#devlog').textContent)||[0,0])[1];
+                    log.push('manual catch: uncaught '+before+' -> '+after);
+                    if(!(+after<+before)) errors.push('manual catch did not take anyone out');
+                    finishUp();
+                  },500);
+                },400);
+              }catch(e){ errors.push('manual catch: '+e.message); finishUp(); }
+              function finishUp(){
               setTimeout(()=>{
                 byLabel('imposter win').click();
                 setTimeout(()=>{
@@ -63,6 +85,7 @@ setTimeout(()=>{
                   finish();
                 },400);
               },400);
+              }
             }
           };
           run();

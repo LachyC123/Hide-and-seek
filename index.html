@@ -123,6 +123,10 @@ input:focus{outline:none;border-color:var(--accent)}
 .rcell.seeking i{color:var(--amber)}
 .rcell.lost i{color:var(--ember)}
 
+/* zoom controls sit in the HUD chip row; the HUD itself ignores taps, so these opt back in */
+.chip.zoom{pointer-events:auto;cursor:pointer;min-width:34px;justify-content:center;text-align:center}
+.chip.zoom b{font-size:17px;line-height:1}
+
 /* multiplayer setup */
 /* body sets user-select:none for the game; these have to opt back in, and iOS only
    honours the -webkit- form — without it the block cannot be selected by hand at all */
@@ -438,11 +442,16 @@ input:focus{outline:none;border-color:var(--accent)}
         <div class="chip"><u>Left</u><b class="mono" id="hLeft">-</b></div>
         <div class="chip" id="hGpsChip"><u>GPS</u><b class="mono" id="hGps">--</b></div>
         <div class="chip hidden" id="hNetChip"><u>Room</u><b class="mono" id="hNet">--</b></div>
+        <div class="chip zoom" id="hZoomOut"><b>&#8722;</b></div>
+        <div class="chip zoom" id="hZoomIn"><b>+</b></div>
       </div>
       <div class="spacer"></div>
       <div class="hudbottom">
         <div class="card hidden" id="taskCard"><h4 id="taskTitle"></h4><p id="taskBody"></p><div class="bar hidden" id="taskBar"><i></i></div></div>
+        <p id="catchnote" class="tiny" style="text-transform:none;letter-spacing:.02em;font-size:12px;
+          margin:0 0 6px;text-align:center;color:var(--amber);pointer-events:none"></p>
         <button class="btn hidden" id="catchbtn">Catch</button>
+        <button class="btn dark small hidden" id="manualbtn">I caught someone</button>
         <button class="btn hidden" id="tipbtn">Send secret tip</button>
         <button class="btn ghost small hidden" id="hostbtn">Host controls</button>
       </div>
@@ -555,7 +564,9 @@ function offsetLatLng(p,dx,dy){ // dx east metres, dy north metres
 }
 
 var CFG={
-  scatter:180, voteLen:60, catchRadius:10, conversion:60, locFresh:25,
+  // catchRadius was 10 m, which is tighter than a phone can actually place two people.
+  // Two handsets at +/-10 m read 20 m apart while their owners are touching.
+  scatter:180, voteLen:60, catchRadius:20, conversion:60, locFresh:45,
   fullSignal:{1:60,2:90}, zoneStages:5, zoneShrink:0.66, zoneMinR:45,
   zonePreview:150, zoneClose:45, graceOutside:45, tribunals:2,
   missionFollowRadius:35, missionFollowTime:25, objectiveRadius:25, objectiveTime:12,
@@ -563,7 +574,10 @@ var CFG={
   trackScale:1, trackRate:1, hiderSight:1, nearWarn:0, objectives:1, mapStyle:'real',
   dimAfter:60,   // seconds untouched before the screen drops to low power
   // GPS handling
-  gpsForgive:1, catchSlop:0.5, catchSlopMax:15, maxAcc:65, maxSpeed:12, gpsQ:1.6,
+  gpsForgive:1, catchSlop:1, catchSlopMax:30, maxAcc:120, maxSpeed:30, gpsQ:1.6,
+  seekers:1,      // how many start the hunt
+  zoneOut:15,     // seconds outside the circle before you are caught; -1 never
+  staleAfter:30,  // after this long with no fix, a player is drawn as a last-known position
   // multiplayer presence: a phone that stops reporting is stale, then lost
   dropStale:45, dropLost:150, hostTimeout:20, syncHost:1200, syncClient:1500,
   // roads: how far a spawn point may be dragged to land on something walkable
@@ -573,23 +587,25 @@ var DEFAULTS=JSON.parse(JSON.stringify(CFG));
 function applyCfg(c){
   if(!c) return CFG;
   ['scatter','catchRadius','conversion','zoneStages','tribunals','trackScale','trackRate',
-   'hiderSight','nearWarn','objectives','gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
+   'hiderSight','nearWarn','seekers','zoneOut','objectives','gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
   if(c.zoneShrink!==undefined) CFG.zoneShrink=clampN(c.zoneShrink,0.4,0.95);
   if(c.fullSignal!==undefined){ CFG.fullSignal={1:c.fullSignal,2:c.fullSignal+30}; }
   return CFG;
 }
 function clampN(v,a,b){return v<a?a:v>b?b:v;}
 function sanitiseCfg(c){
-  var d={matchLen:1800,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
+  var d={matchLen:1800,areaR:450,imposters:1,scatter:180,catchRadius:20,conversion:60,seekers:1,zoneOut:15,
     fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-    hiderSight:1,nearWarn:0,objectives:1,gpsForgive:1,mapStyle:'real'};
+    hiderSight:1,nearWarn:0,seekers:1,zoneOut:15,objectives:1,gpsForgive:1,mapStyle:'real'};
   c=c||{};
   var o={
     matchLen:clampN(+c.matchLen||d.matchLen,600,5400),
     areaR:clampN(+c.areaR||d.areaR,100,1500),
     imposters:(c.imposters===undefined?d.imposters:(c.imposters?1:0)),
     scatter:clampN(+c.scatter||d.scatter,30,600),
-    catchRadius:clampN(+c.catchRadius||d.catchRadius,5,30),
+    catchRadius:clampN(+c.catchRadius||d.catchRadius,5,60),
+    seekers:clampN(c.seekers===undefined?d.seekers:+c.seekers,1,4),
+    zoneOut:(c.zoneOut===undefined?d.zoneOut:clampN(+c.zoneOut,-1,120)),
     conversion:clampN(+c.conversion||d.conversion,10,180),
     fullSignal:clampN(+c.fullSignal||d.fullSignal,20,180),
     zoneStages:clampN(c.zoneStages===undefined?d.zoneStages:+c.zoneStages,0,8),
@@ -633,23 +649,24 @@ function huntClock(t){return Math.max(0,t-CFG.scatter);}
    but more than one and the shuffle still picks between them — volunteering means you are
    in the running, not that you are guaranteed it. With nobody volunteering this behaves
    exactly as it always did. A volunteer who misses out can still draw the imposter. */
-function assignRoles(ids,rng,imposters,volunteers){
+function assignRoles(ids,rng,imposters,volunteers,seekers){
   var pool=ids.slice(), out={}, i;
   for(i=pool.length-1;i>0;i--){var j=Math.floor(rng()*(i+1));var tmp=pool[i];pool[i]=pool[j];pool[j]=tmp;}
   for(i=0;i<pool.length;i++) out[pool[i]]='hider';
-  var seeker=pool[0];
-  if(volunteers&&volunteers.length){
-    for(i=0;i<pool.length;i++){
-      if(volunteers.indexOf(pool[i])>=0){ seeker=pool[i]; break; }
-    }
-  }
-  out[seeker]='seeker';
+  // there must always be someone left to hunt
+  var want=clampN(seekers||1,1,Math.max(1,pool.length-1)),chosen=[];
+  if(volunteers&&volunteers.length)
+    for(i=0;i<pool.length&&chosen.length<want;i++)
+      if(volunteers.indexOf(pool[i])>=0) chosen.push(pool[i]);
+  for(i=0;i<pool.length&&chosen.length<want;i++)
+    if(chosen.indexOf(pool[i])<0) chosen.push(pool[i]);
+  for(i=0;i<chosen.length;i++) out[chosen[i]]='seeker';
   var imp=null;
-  if(imposters>0&&pool.length>2){
-    for(i=0;i<pool.length;i++){ if(pool[i]!==seeker){ imp=pool[i]; break; } }
+  if(imposters>0&&pool.length>chosen.length+1){
+    for(i=0;i<pool.length;i++){ if(chosen.indexOf(pool[i])<0){ imp=pool[i]; break; } }
     if(imp) out[imp]='imposter';
   }
-  return {roles:out,imposterId:imp,seekerId:seeker};
+  return {roles:out,imposterId:imp,seekerId:chosen[0],seekerIds:chosen};
 }
 function volunteerIds(players){
   return Object.keys(players||{}).filter(function(id){
@@ -749,6 +766,27 @@ function canCatch(seeker,target,nowMs,radius){
   return metersBetween(seeker,target)<=radius;
 }
 
+/* Why the catch button is or is not showing. Silence was the worst part of this:
+   a seeker standing next to someone got no button and no explanation, and could not
+   tell a stale phone from being out of range. */
+function catchStatus(seeker,players,nowMs,radius){
+  if(!seeker||seeker.role!=='seeker'||seeker.caught) return {ok:false,why:'notseeker'};
+  var best=null;
+  Object.keys(players||{}).forEach(function(id){
+    var q=players[id];
+    if(!q||id===seeker.id||q.role==='seeker'||q.caught||q.lat==null) return;
+    var d=metersBetween(seeker,q);
+    if(!best||d<best.dist) best={target:q,dist:d};
+  });
+  if(!best) return {ok:false,why:'none'};
+  var reach=catchDistance(seeker,best.target,radius);
+  var out={target:best.target,dist:best.dist,reach:reach,ok:false,why:''};
+  if(!seeker.locT||nowMs-seeker.locT>CFG.locFresh*1000){ out.why='you'; return out; }
+  if(!best.target.locT||nowMs-best.target.locT>CFG.locFresh*1000){ out.why='them'; return out; }
+  if(best.dist>reach){ out.why='far'; return out; }
+  out.ok=true; return out;
+}
+
 /* --- voting ----------------------------------------------------------- */
 function eligibleVoters(players){
   return Object.keys(players).filter(function(id){var p=players[id];return !p.caught&&p.role!=='seeker';});
@@ -806,6 +844,20 @@ function outsideState(p,zone,nowMs){
   return {outside:true,level:secs<CFG.graceOutside+60?1:2};
 }
 
+/* Being outside the circle now ends your hunt rather than merely lighting you up.
+   The grace is short but not zero by default: GPS wobble at the boundary would
+   otherwise knock people out while they are stood still just inside it. */
+function zoneVerdict(p,zone,nowMs){
+  var os=outsideState(p,zone,nowMs);
+  if(!os.outside) return {outside:false,out:false,left:null,level:0};
+  if(CFG.zoneOut<0) return {outside:true,out:false,left:null,level:os.level};
+  var secs=p.outsideSince?Math.max(0,(nowMs-p.outsideSince)/1000):0;
+  return {outside:true,out:secs>=CFG.zoneOut,left:Math.max(0,CFG.zoneOut-secs),level:os.level};
+}
+/* How long since this phone last said anything about where it is. */
+function fixAge(p,nowMs){ return (!p||!p.locT)?Infinity:(nowMs-p.locT)/1000; }
+function isStale(p,nowMs){ return fixAge(p,nowMs)>CFG.staleAfter; }
+
 /* --- imposter missions --------------------------------------------------- */
 /* `roads` is optional: {centre,graph}. With it, a lure spot lands on a street the
    imposter can actually stand on instead of the middle of a lake or a locked yard. */
@@ -854,7 +906,7 @@ function missionTick(m,imp,players,dt){
 
 function makeGpsFilter(){
   return {
-    pos:null, v:0, t:0, rejected:0, accepted:0,
+    pos:null, v:0, t:0, rejected:0, accepted:0, miss:0,
     push:function(fix){
       // fix: {lat,lng,acc,t}
       if(!fix||fix.lat==null) return null;
@@ -866,10 +918,14 @@ function makeGpsFilter(){
       }
       var dt=Math.max(0.1,(fix.t-this.t||fix.t-this.pos.t)/1000);
       var d=metersBetween(this.pos,fix);
-      // reject a wildly inaccurate fix unless we've had nothing for a while
-      if(acc>CFG.maxAcc&&d<400&&(fix.t-this.pos.t)<15000){ this.rejected++; return this.pos; }
-      // reject teleports faster than a person can run
-      if(d/dt>CFG.maxSpeed&&d>acc*2&&(fix.t-this.pos.t)<15000){ this.rejected++; return this.pos; }
+      // Rejecting is how a player freezes on everyone else's map, so never reject for
+      // long: after a few refusals in a row, take whatever the phone is offering.
+      var stuck=(this.miss||0)>=3;
+      if(!stuck&&acc>CFG.maxAcc&&d<400&&(fix.t-this.pos.t)<15000){
+        this.rejected++; this.miss=(this.miss||0)+1; return this.pos; }
+      if(!stuck&&d/dt>CFG.maxSpeed&&d>acc*2&&(fix.t-this.pos.t)<15000){
+        this.rejected++; this.miss=(this.miss||0)+1; return this.pos; }
+      this.miss=0;
       this.v+=dt*CFG.gpsQ*CFG.gpsQ;
       var k=this.v/(this.v+acc*acc);
       var b=dirTo2(this.pos,fix);
@@ -967,6 +1023,22 @@ function lostHiders(players,nowMs){
     var p=players[id];
     return p&&!p.caught&&p.role!=='seeker'&&presence(p,nowMs)==='lost';
   });
+}
+/* A phone that reloads gets a brand new id, so matching on id alone can never let
+   anyone back in. If a player with the same name has gone quiet, that seat is theirs. */
+function rejoinSlot(players,meId,name,nowMs){
+  if(!players) return null;
+  if(meId&&players[meId]) return meId;
+  if(!name) return null;
+  var want=String(name).toUpperCase(),hit=null;
+  Object.keys(players).forEach(function(id){
+    var p=players[id];
+    if(hit||!p||p.bot) return;
+    if(String(p.name||'').toUpperCase()!==want) return;
+    if(presence(p,nowMs)==='live') return;         // that phone is still playing
+    hit=id;
+  });
+  return hit;
 }
 function hostAlive(st,nowMs){ return !!st&&(nowMs-(st.hostAt||0))<CFG.hostTimeout*1000; }
 
@@ -1587,7 +1659,8 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,volunteerIds:volunteerIds,nextZone:nextZone,
   zoneContains:zoneContains,zoneStageTimes:zoneStageTimes,trackingBand:trackingBand,makeBlip:makeBlip,
   signalGap:signalGap,sees:sees,nearestSeeker:nearestSeeker,
-  canCatch:canCatch,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
+  canCatch:canCatch,catchStatus:catchStatus,zoneVerdict:zoneVerdict,
+  fixAge:fixAge,isStale:isStale,rejoinSlot:rejoinSlot,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
   factionCounts:factionCounts,checkWin:checkWin,outsideState:outsideState,pickMission:pickMission,
   missionTick:missionTick,missionTarget:missionTarget,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
   catchDistance:catchDistance,makeGpsFilter:makeGpsFilter,gpsQuality:gpsQuality,
@@ -1635,11 +1708,12 @@ var G={
   bots:[], dev:false, simMove:false,
   cfg:{matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
        fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-       hiderSight:1,nearWarn:0,objectives:1,gpsForgive:1,mapStyle:'real'},
+       hiderSight:1,nearWarn:0,seekers:1,zoneOut:15,objectives:1,gpsForgive:1,mapStyle:'real'},
   mp:null,               // {url,key} — Supabase project, from the join link or setup screen
   ack:0,                 // highest action seq the host has confirmed
   dropped:{},            // host-side: ids pruned from the lobby, and the row that did it
   netBusy:false, flush:false, lastPush:0, lastGoodPull:0, netErr:0, joinLink:'',
+  zoom:1,
   blipCache:{}, rng:mulberry32(now()&0xffffffff)
 };
 
@@ -1735,6 +1809,30 @@ function paintChar(cv,idx,dir,frame){
      through NET, which has two adapters: Supabase over plain REST (works from
      any static host, phone to phone) and the window.storage bridge (only works
      inside a host page that injects it). */
+/* Somewhere to keep the profile between visits. The host bridge is used when a page
+   provides it; otherwise localStorage, because on a static host there is nothing else
+   and without it the player id is regenerated on every load — which is precisely why
+   nobody could rejoin a match they had dropped out of. Falls back to memory so the
+   game still runs where storage is blocked entirely. */
+var STORE=(function(){
+  if(window.storage&&window.storage.get) return {kind:'host',
+    get:function(k){return window.storage.get(k,false).then(function(r){return r?r.value:null;})
+      .catch(function(){return null;});},
+    set:function(k,v){try{return Promise.resolve(window.storage.set(k,v,false));}catch(e){return Promise.resolve();}},
+    del:function(k){try{return Promise.resolve(window.storage.delete&&window.storage.delete(k,false));}
+      catch(e){return Promise.resolve();}}};
+  var ls=null;
+  try{ ls=window.localStorage; ls.setItem('fs:probe','1'); ls.removeItem('fs:probe'); }catch(e){ ls=null; }
+  if(ls) return {kind:'local',
+    get:function(k){try{return Promise.resolve(ls.getItem(k));}catch(e){return Promise.resolve(null);}},
+    set:function(k,v){try{ls.setItem(k,v);}catch(e){} return Promise.resolve();},
+    del:function(k){try{ls.removeItem(k);}catch(e){} return Promise.resolve();}};
+  var mem={};
+  return {kind:'none',
+    get:function(k){return Promise.resolve(mem[k]===undefined?null:mem[k]);},
+    set:function(k,v){mem[k]=v;return Promise.resolve();},
+    del:function(k){delete mem[k];return Promise.resolve();}};
+})();
 function hasStore(){return !!(window.storage&&window.storage.get);}
 function K(code,suffix){return 'fs:'+code+(suffix||'');}
 function sput(k,v){ if(!hasStore()) return Promise.reject('nostore');
@@ -2004,6 +2102,14 @@ function hostSim(){
     if(os.outside){ if(!p.outsideSince) p.outsideSince=n; }
     else p.outsideSince=null;
     if(os.level>0){ p.exposedUntil=n+6000; if(os.level>1) p.liveUntil=n+6000; p.stats.exposed++; }
+    var zv=zoneVerdict(p,st.zone,n);
+    if(zv.out){
+      p.caught=true; p.convertAt=n+CFG.conversion*1000; p.outsideSince=null;
+      pushEvent(st,'all','caught','OUT OF BOUNDS',p.name+' stayed outside the circle and is out.');
+      pushEvent(st,id,'you-caught','OUT OF BOUNDS',"You left the safe zone. You're joining the hunt.");
+      var wz=checkWin(st); if(wz) endMatch(st,wz);
+      return;
+    }
     p.stats.survived=hc;
   });
 
@@ -2166,6 +2272,18 @@ function applyAction(st,pid,a){
       var w=checkWin(st); if(w) endMatch(st,w);
     }
   }
+  if(a.type==='claim'&&p.role==='seeker'&&!p.caught){
+    // A seeker saying "I tagged them" outranks whatever the satellites think. Nothing
+    // else works if the phones disagree about where two people standing together are.
+    var ct=st.players[a.data];
+    if(ct&&!ct.caught&&ct.role!=='seeker'&&ct.id!==p.id){
+      ct.caught=true; ct.convertAt=now()+CFG.conversion*1000; ct.outsideSince=null;
+      p.stats.catches++;
+      pushEvent(st,'all','caught','HIDER CAUGHT',ct.name+' has been caught by '+p.name+'.');
+      pushEvent(st,ct.id,'you-caught','CAUGHT!',"You're joining the hunt.");
+      var wc=checkWin(st); if(wc) endMatch(st,wc);
+    }
+  }
   if(a.type==='vote'&&st.tribunal&&!st.tribunal.done){
     if(eligibleVoters(st.players).indexOf(pid)>=0) st.tribunal.votes[pid]=a.data;
   }
@@ -2202,7 +2320,7 @@ function applyAction(st,pid,a){
 function startMatch(st){
   var ids=Object.keys(st.players);
   if(ids.length<2){ toast('Need at least 2 players'); return; }
-  var r=assignRoles(ids,mulberry32(st.seed),st.cfg.imposters,volunteerIds(st.players));
+  var r=assignRoles(ids,mulberry32(st.seed),st.cfg.imposters,volunteerIds(st.players),st.cfg.seekers);
   ids.forEach(function(id){ st.players[id].role=r.roles[id]; });
   st.imposterId=r.imposterId; st.imposterEligible=!!r.imposterId;
   st.phase='SCATTER'; st.t0=now(); st._last=now();
@@ -2536,7 +2654,17 @@ function initMap(){
     G.pos=offsetLatLng(G.pos||G.st.zone,-dx*m,dy*m); G.pos.t=now(); G.pos.acc=5;
     pushLocalPos();
   },{passive:true});
-  cv.addEventListener('touchend',function(){drag=null;});
+  cv.addEventListener('touchend',function(){drag=null;pinch=null;});
+  // pinch to zoom — the map used to frame itself and give you no say
+  var pinch=null;
+  cv.addEventListener('touchstart',function(e){
+    if(e.touches.length===2){ pinch={d:touchGap(e),z:G.zoom}; drag=null; }
+  },{passive:true});
+  cv.addEventListener('touchmove',function(e){
+    if(e.touches.length!==2||!pinch) return;
+    var d=touchGap(e); if(!d||!pinch.d) return;
+    setZoom(pinch.z*(d/pinch.d));
+  },{passive:true});
   cv.addEventListener('mousedown',function(e){ if(!G.simMove)return; drag={x:e.clientX,y:e.clientY}; });
   window.addEventListener('mousemove',function(e){
     if(!G.simMove||!drag)return;
@@ -2545,6 +2673,12 @@ function initMap(){
   });
   window.addEventListener('mouseup',function(){drag=null;});
 }
+function touchGap(e){
+  var a=e.touches[0],b=e.touches[1];
+  var dx=a.clientX-b.clientX, dy=a.clientY-b.clientY;
+  return Math.sqrt(dx*dx+dy*dy);
+}
+function setZoom(z){ G.zoom=clamp(z,0.35,5); touched(); }
 function resizeMap(){
   if(!cv) return;
   // Phones have been 3x for years. Capping at 2 threw away a third of the resolution
@@ -2748,13 +2882,17 @@ function drawPlayers(st){
     var S=clamp(Math.round(2.4/Math.max(0.6,G.view.mpp)*2),2,5);
     // shadow
     ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(s.x-4*S/2,s.y-2,4*S,2*S/2);
-    var alpha=p.caught?0.5:1;
+    var stale=(id!==G.me.id)&&isStale(p,now());
+    var alpha=p.caught?0.5:(stale?0.45:1);
     drawChar(ctx,p.char,r.dir,r.moving?frame:0,S,s.x-7*S,s.y-18*S,alpha);
     var col=p.id===G.me.id?'#43b0e8'
       :p.role==='seeker'?'#f2a63b'
       :(mine.role!=='seeker'?'#63c77c':'#f2ecdf');    // green: on your side
-    label(s.x,s.y-19*S,p.name.toUpperCase(),col,9);
+    label(s.x,s.y-19*S,p.name.toUpperCase(),stale?'#9a92b5':col,9);
     if(p.caught) label(s.x,s.y+10,'CAUGHT','#e8503a',8);
+    // Vanishing was worse than being wrong: people simply were not on the map. Show the
+    // last place they were seen and say how old it is.
+    else if(stale) label(s.x,s.y+10,'LAST SEEN '+mmss(fixAge(p,now())),'#9a92b5',8);
   });
   // accuracy ring for self
   if(G.pos&&G.pos.acc>25){
@@ -2771,7 +2909,8 @@ function renderMap(){
   if(!isFinite(G.view.lat)||G.view.lat===0){G.view.lat=c.lat;G.view.lng=c.lng;}
   var minDim=Math.min(VW,VH);
   var want=clamp((z.r*2)/(minDim*0.8),0.35,3.2);
-  G.view.mpp+=(want-G.view.mpp)*0.05;
+  want=clamp(want/(G.zoom||1),0.12,6);
+  G.view.mpp+=(want-G.view.mpp)*0.12;
   drawTerrain(z);
   drawZone(z,st);
   drawObjectives(st);
@@ -2838,12 +2977,12 @@ function drainEvents(){
 function saveProfile(){
   // the id has to survive a reload, or a phone that locks itself mid-match comes
   // back as a stranger and can never rejoin the room it is already in
-  try{ if(window.storage) window.storage.set('fs:profile',
-    JSON.stringify({name:G.me.name,char:G.me.char,id:G.me.id,mp:G.mp}),false); }catch(e){}
+  STORE.set('fs:profile',JSON.stringify({name:G.me.name,char:G.me.char,id:G.me.id,mp:G.mp}));
 }
 function loadProfile(){
-  if(!window.storage) return Promise.resolve(null);
-  return window.storage.get('fs:profile',false).then(function(r){return r?JSON.parse(r.value):null;}).catch(function(){return null;});
+  return STORE.get('fs:profile').then(function(v){
+    try{ return v?JSON.parse(v):null; }catch(e){ return null; }
+  },function(){ return null; });
 }
 
 /* ---------- character picker ---------- */
@@ -3137,20 +3276,32 @@ function updateHUD(){
     else bar.classList.add('hidden');
   } else card.classList.add('hidden');
 
-  // catch button
-  var cb=$('#catchbtn'),target=null;
-  if(p.role==='seeker'&&!p.caught&&G.pos){
-    var best=1e9;
-    var lp={id:p.id,role:p.role,caught:p.caught,lat:G.pos.lat,lng:G.pos.lng,locT:G.pos.t};
-    Object.keys(st.players).forEach(function(id){
-      var q=st.players[id];
-      if(canCatch(lp,q,now())){ var d=metersBetween(lp,q); if(d<best){best=d;target=q;} }
-    });
-  }
-  if(target){ cb.classList.remove('hidden'); cb.textContent='Catch '+target.name.toUpperCase();
-    cb.onclick=function(){ SFX.caught(); buzz(200); act('catch',target.id); cb.classList.add('hidden'); };
-    if(!G._catchBuzz){G._catchBuzz=1;buzz(60);}
-  } else { cb.classList.add('hidden'); G._catchBuzz=0; }
+  // catch button, plus an honest reason when there isn't one
+  var cb=$('#catchbtn'),mb=$('#manualbtn'),cn=$('#catchnote');
+  var amSeeker=(p.role==='seeker'&&!p.caught);
+  if(amSeeker){
+    var lp={id:p.id,role:'seeker',caught:false,acc:G.pos?G.pos.acc:null,
+      lat:G.pos?G.pos.lat:p.lat,lng:G.pos?G.pos.lng:p.lng,locT:G.pos?G.pos.t:p.locT};
+    var cs=catchStatus(lp,st.players,now(),CFG.catchRadius);
+    if(cs.ok&&cs.target){
+      var tid=cs.target.id;
+      cb.classList.remove('hidden');
+      cb.textContent='Catch '+cs.target.name.toUpperCase()+' · '+Math.round(cs.dist)+' m';
+      cb.onclick=function(){ SFX.caught(); buzz(200); act('catch',tid); cb.classList.add('hidden'); };
+      if(!G._catchBuzz){G._catchBuzz=1;buzz(60);}
+      cn.textContent='';
+    } else {
+      cb.classList.add('hidden'); G._catchBuzz=0;
+      cn.textContent=
+        cs.why==='none'?'Nobody left to catch.'
+        :cs.why==='you'?'Waiting for your own GPS — stand still for a moment.'
+        :cs.why==='them'?(cs.target.name+"'s phone hasn't reported for a while. Use “I caught someone”.")
+        :cs.why==='far'?(cs.target.name+' is about '+Math.round(cs.dist)+' m away — get within '+
+                         Math.round(cs.reach)+' m.')
+        :'';
+    }
+    mb.classList.remove('hidden');
+  } else { cb.classList.add('hidden'); mb.classList.add('hidden'); cn.textContent=''; G._catchBuzz=0; }
 
   // pause overlay — everyone sees it, only the host can lift it
   var pv=$('#paused');
@@ -3196,6 +3347,30 @@ function updateHUD(){
       }
     }
   }
+}
+/* The fallback that has to work when nothing else does: the seeker says who they
+   tagged and that is the end of it. No distance check, no freshness check. */
+function openManualCatch(){
+  var st=G.st,here=G.pos;
+  var ids=Object.keys(st.players).filter(function(id){
+    var q=st.players[id];
+    return q&&!q.caught&&q.role!=='seeker'&&id!==G.me.id;
+  });
+  if(!ids.length){ toast('Nobody left to catch'); return; }
+  ids.sort(function(a,b){
+    var pa=st.players[a],pb=st.players[b];
+    var da=(here&&pa.lat!=null)?metersBetween(here,pa):1e9;
+    var db=(here&&pb.lat!=null)?metersBetween(here,pb):1e9;
+    return da-db;
+  });
+  modal('Who did you catch?','Tap their name. They are out straight away — no GPS needed.',
+    ids.slice(0,8).map(function(id){
+      var q=st.players[id];
+      var d=(here&&q.lat!=null)?(' · about '+Math.round(metersBetween(here,q))+' m'):'';
+      return {label:q.name.toUpperCase()+d,fn:function(){
+        SFX.caught(); buzz(200); act('claim',id);
+      }};
+    }));
 }
 function openHostMenu(){
   modal('Host controls','You are running this match on your phone.',[
@@ -3357,7 +3532,9 @@ function joinGame(code){
   msg.textContent='Looking for '+code+'…';
   netGetState(code).then(function(s){
     if(!s||!s.code){ msg.textContent='No game found with that code.'; SFX.bad(); return; }
-    var rejoin=!!s.players[G.me.id];
+    var slot=rejoinSlot(s.players,G.me.id,G.me.name,now());
+    if(slot&&slot!==G.me.id){ G.me.id=slot; saveProfile(); }   // take your old seat back
+    var rejoin=!!slot;
     if(!rejoin&&s.phase!=='LOBBY'){ msg.textContent='That match has already started.'; SFX.bad(); return; }
     if(!rejoin&&s.phase==='RESULTS'){ msg.textContent='That match is over.'; SFX.bad(); return; }
     if(!rejoin&&Object.keys(s.players).length>=12){ msg.textContent='That lobby is full.'; SFX.bad(); return; }
@@ -3426,6 +3603,7 @@ function buildDev(){
       devButton('new mission',function(){ newMission(G.st,mulberry32(now()|0)); }),
       devButton('complete mission',function(){ if(G.st.mission)G.st.mission.progress=G.st.mission.need; }),
       devButton('+1 tip',function(){ G.st.tips++; }),
+      devButton('make me seeker',function(){ var p=me(); if(p){ p.role='seeker'; p.caught=false; } }),
       devButton('make me imposter',function(){ G.st.imposterId=G.me.id;G.st.imposterEligible=true;
         G.st.players[G.me.id].role='imposter';roleShown=false; })
     ]],
@@ -3704,6 +3882,9 @@ var SETUP=[
   {sec:'Catching'},
   {k:'catchRadius',t:'Catch distance',type:'range',min:5,max:30,step:1,
    fmt:function(v){return v+' m';},h:'How close a seeker must be to catch someone. Small = tense. Large = forgiving in built-up areas.'},
+  {k:'seekers',t:'Seekers at the start',type:'seg',opts:[[1,'1'],[2,'2'],[3,'3']],
+   h:'With six or more players one seeker is slow going until the first catch. Two gets a '+
+     'big group moving straight away.'},
   {k:'gpsForgive',t:'GPS allowance',type:'seg',opts:[[1,'On'],[0,'Strict']],
    h:'On: adds a little slack when phone accuracy is poor, so real tags are not refused.'},
   {k:'conversion',t:'Time to turn seeker',type:'range',min:10,max:180,step:5,
@@ -3716,6 +3897,10 @@ var SETUP=[
      'only ever see someone during full signal or after a long time outside the zone — pure '+
      'hide and seek, and much harder for them.'},
   {sec:'The zone'},
+  {k:'zoneOut',t:'Leaving the circle',type:'seg',opts:[[0,'Out at once'],[15,'15s grace'],[-1,'Never out']],
+   h:'Out at once ends your hunt the moment you step outside. 15 seconds allows for GPS '+
+     'wobble at the edge. Never out only lights you up for the seekers — which is what let '+
+     'people sit outside the circle all match.'},
   {k:'zoneStages',t:'Zone moves',type:'range',min:0,max:8,step:1,
    fmt:function(v){return v===0?'never':v+'×';},h:'How many times the safe circle shrinks and relocates.'},
   {k:'zoneShrink',t:'Shrink per move',type:'range',min:0.4,max:0.95,step:0.05,
@@ -3820,8 +4005,10 @@ function fetchStreets(centre,radius,force){
   var key=streetsCacheKey(centre,radius);
   STREETS.status='loading'; STREETS.err=null;
   var useCache=function(){
-    if(force||!window.storage) return Promise.resolve(null);
-    return window.storage.get(key,false).then(function(r){return r?JSON.parse(r.value):null;}).catch(function(){return null;});
+    if(force) return Promise.resolve(null);
+    return STORE.get(key).then(function(v){
+      try{ return v?JSON.parse(v):null; }catch(e){ return null; }
+    },function(){ return null; });
   };
   useCache().then(function(cached){
     if(cached&&cached.ways&&cached.ways.length){
@@ -3830,7 +4017,7 @@ function fetchStreets(centre,radius,force){
     }
     return overpassTry(centre,radius).then(function(res){
       setStreets(res.ways,centre,radius,{source:res.source});
-      try{ if(window.storage) window.storage.set(key,JSON.stringify({ways:res.ways,centre:STREETS.centre,radius:radius}),false); }catch(e){}
+      STORE.set(key,JSON.stringify({ways:res.ways,centre:STREETS.centre,radius:radius}));
       return null;
     });
   }).catch(function(e){
@@ -3909,6 +4096,7 @@ function withCanvas(pctx,w,h,view,fn,dpr){
 }
 var PV_MODE={matchLen:'area',areaR:'area',scatter:'run',catchRadius:'catch',gpsForgive:'catch',
   conversion:'run',trackScale:'signal',trackRate:'signal',hiderSight:'area',nearWarn:'catch',
+  seekers:'area',zoneOut:'zones',
   zoneStages:'zones',zoneShrink:'zones',
   imposters:'area',tribunals:'area',fullSignal:'run',objectives:'area',mapStyle:'area'};
 function pvRing(c,r,col,dash,width){
@@ -4031,7 +4219,9 @@ function rulesSummary(c){
     (c.tribunals?c.tribunals+' vote'+(c.tribunals>1?'s':''):'no votes'),
     (c.zoneStages?c.zoneStages+' zone moves':'zone never moves'),
     (c.trackRate>0?'signal every '+Math.round(35/c.trackRate)+'s':'no seeker signals'),
-    (c.hiderSight?'hiders see each other':'hiders are alone')];
+    (c.hiderSight?'hiders see each other':'hiders are alone'),
+    ((c.seekers||1)>1?c.seekers+' seekers':'1 seeker'),
+    (c.zoneOut<0?'zone is a warning only':c.zoneOut?'out '+c.zoneOut+'s after leaving':'out at once if you leave')];
   return bits.join(' · ');
 }
 
@@ -4089,7 +4279,7 @@ function boot(){
   $('#b-reset-rules').onclick=function(){
     G.cfg={matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
       fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-      hiderSight:1,nearWarn:0,objectives:1,gpsForgive:1,mapStyle:'real'};
+      hiderSight:1,nearWarn:0,seekers:1,zoneOut:15,objectives:1,gpsForgive:1,mapStyle:'real'};
     buildSetup(); pvFocus('areaR'); SFX.ok();
   };
   $('#b-create').onclick=function(){ SFX.tap(); buildSetup();
@@ -4109,7 +4299,7 @@ function boot(){
     var c=G.pos||DEFAULT_CENTRE; fetchStreets(c,Math.max(400,G.cfg.areaR+200),true); renderDiag(); };
   $('#b-diag-clear').onclick=function(){
     var c=G.pos||DEFAULT_CENTRE;
-    try{ if(window.storage) window.storage.delete(streetsCacheKey(c,Math.max(400,G.cfg.areaR+200)),false); }catch(e){}
+    STORE.del(streetsCacheKey(c,Math.max(400,G.cfg.areaR+200)));
     STREETS={status:'idle',ways:[],centre:null,radius:0,err:null,at:0,graph:null,source:null};
     TILE.cache={}; TILE.loaded=0; TILE.fails=0; TILE.on=true; SFX.tap(); renderDiag(); };
   $('#b-profile').onclick=function(){ SFX.tap(); buildCharGrid(); show('s-char'); };
@@ -4148,6 +4338,9 @@ function boot(){
     $('#b-vote-lock').textContent='Skipped'; $('#b-vote-lock').disabled=true; };
   $('#b-again').onclick=function(){ SFX.tap(); G.bots=[]; createGame(G.mode==='solo'); };
   $('#b-home').onclick=function(){ leaveRoom(); SFX.tap(); show('s-home'); };
+  $('#hZoomIn').onclick=function(){ SFX.tap(); setZoom((G.zoom||1)*1.5); };
+  $('#hZoomOut').onclick=function(){ SFX.tap(); setZoom((G.zoom||1)/1.5); };
+  $('#manualbtn').onclick=function(){ SFX.tap(); openManualCatch(); };
   $('#hostbtn').onclick=function(){ SFX.tap(); openHostMenu(); };
   $('#b-resume').onclick=function(){ SFX.ok(); act('resume'); };
   $('#devtab').onclick=function(){ $('#dev').classList.toggle('show'); };

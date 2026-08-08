@@ -89,9 +89,13 @@ function hiderAt(dx){const p=C.offsetLatLng(O,dx,0);return {id:'h',role:'hider',
 t('catch inside radius',()=>ok(C.canCatch(seeker,hiderAt(6),now)));
 t('no catch outside radius',()=>ok(!C.canCatch(seeker,hiderAt(30),now)));
 t('no catch on stale target location',()=>{
-  const h=hiderAt(5);h.locT=now-40000;return ok(!C.canCatch(seeker,h,now));});
+  const h=hiderAt(5);h.locT=now-(C.CFG.locFresh+10)*1000;return ok(!C.canCatch(seeker,h,now));});
 t('no catch on stale seeker location',()=>{
-  const s={...seeker,locT:now-40000};return ok(!C.canCatch(s,hiderAt(5),now));});
+  const s={...seeker,locT:now-(C.CFG.locFresh+10)*1000};return ok(!C.canCatch(s,hiderAt(5),now));});
+t('a position from a few seconds ago is still good enough to catch on',()=>{
+  // phones report every couple of seconds and sync adds a few more; being strict here
+  // is what made a seeker stood next to someone unable to catch them
+  const h=hiderAt(5);h.locT=now-8000;return ok(C.canCatch(seeker,h,now));});
 t('hider cannot catch',()=>{
   const s={...seeker,role:'hider'};return ok(!C.canCatch(s,hiderAt(5),now));});
 t('cannot catch an already caught player',()=>{
@@ -245,7 +249,7 @@ t('lure spot is inside the safe zone',()=>{
 t('sanitiseCfg clamps a silly match length',()=>{
   const c=C.sanitiseCfg({matchLen:999999});return eq(c.matchLen,5400);});
 t('sanitiseCfg clamps catch distance',()=>{
-  eq(C.sanitiseCfg({catchRadius:400}).catchRadius,30);
+  eq(C.sanitiseCfg({catchRadius:400}).catchRadius,60);
   return eq(C.sanitiseCfg({catchRadius:1}).catchRadius,5);});
 t('sanitiseCfg keeps a sane head start relative to match length',()=>{
   const c=C.sanitiseCfg({matchLen:600,scatter:600});return ok(c.scatter<=240);});
@@ -257,7 +261,7 @@ t('applyCfg changes live behaviour then resets',()=>{
   C.applyCfg(C.sanitiseCfg({catchRadius:25,tribunals:1}));
   const wide=C.CFG.catchRadius, tri=C.CFG.tribunals;
   C.applyCfg(C.sanitiseCfg({}));
-  return ok(wide===25&&tri===1&&C.CFG.catchRadius===10&&C.CFG.tribunals===2);});
+  return ok(wide===25&&tri===1&&C.CFG.catchRadius===C.DEFAULTS.catchRadius&&C.CFG.tribunals===2);});
 t('one tribunal is scheduled at halfway',()=>{
   C.applyCfg(C.sanitiseCfg({tribunals:1}));
   const s=C.schedule({matchLen:1800});
@@ -282,7 +286,8 @@ t('tighter signal setting shrinks blip uncertainty',()=>{
 
 /* ---- GPS allowance on catching ---- */
 t('catch distance grows with poor accuracy',()=>{
-  const d=C.catchDistance({acc:40},{acc:40},10);return ok(d>10&&d<=25);});
+  const d=C.catchDistance({acc:40},{acc:40},10);
+  return ok(d>10&&d<=10+C.CFG.catchSlopMax,'got '+d);});
 t('catch distance is unchanged with good accuracy',()=>eq(C.catchDistance({acc:5},{acc:6},10),10));
 t('catch allowance is capped',()=>ok(C.catchDistance({acc:400},{acc:400},10)<=10+C.CFG.catchSlopMax));
 t('strict mode ignores accuracy entirely',()=>{
@@ -290,7 +295,7 @@ t('strict mode ignores accuracy entirely',()=>{
   const d=C.catchDistance({acc:60},{acc:60},10);
   C.applyCfg(C.sanitiseCfg({}));return eq(d,10);});
 t('a marginal tag succeeds with allowance and fails without',()=>{
-  const p=C.offsetLatLng(O,16,0);
+  const p=C.offsetLatLng(O,34,0);
   const s={id:'s',role:'seeker',lat:O.lat,lng:O.lng,locT:now,acc:35};
   const h={id:'h',role:'hider',caught:false,lat:p.lat,lng:p.lng,locT:now,acc:35};
   const withAllowance=C.canCatch(s,h,now);
@@ -1002,6 +1007,109 @@ t('hiders seeing each other never leaks who the imposter is',()=>{
   const asHider=withSight(1,()=>C.sees(vHider,vHider2,room(),0));
   const asImp=withSight(1,()=>C.sees(vHider,{id:'i1',role:'imposter'},room(),0));
   return eq(asHider,asImp);});
+
+/* ---- catching, and being told why not ---- */
+const csSeeker=(over)=>Object.assign({id:'s',role:'seeker',caught:false,
+  lat:O.lat,lng:O.lng,locT:now,acc:8},over||{});
+const csHider=(m,over)=>{const p=C.offsetLatLng(O,m,0);
+  return Object.assign({id:'h',role:'hider',caught:false,lat:p.lat,lng:p.lng,locT:now,acc:8},over||{});};
+t('standing next to someone gives you a catch',()=>{
+  const r=C.catchStatus(csSeeker(),{h:csHider(3)},now,20);
+  return ok(r.ok&&r.target.id==='h'&&r.dist<5);});
+t('the nearest hider is the one offered, not whoever came first',()=>{
+  const r=C.catchStatus(csSeeker(),{far:csHider(80,{id:'far'}),near:csHider(4,{id:'near'})},now,20);
+  return eq(r.target.id,'near');});
+t('too far away says so, and says how far',()=>{
+  const r=C.catchStatus(csSeeker(),{h:csHider(90)},now,20);
+  return ok(!r.ok&&r.why==='far'&&Math.round(r.dist)>85);});
+t('a target whose phone went quiet is named, not silently dropped',()=>{
+  const r=C.catchStatus(csSeeker(),{h:csHider(3,{locT:now-(C.CFG.locFresh+20)*1000})},now,20);
+  return ok(!r.ok&&r.why==='them'&&r.target.id==='h');});
+t('your own missing fix is reported as yours, not theirs',()=>{
+  const r=C.catchStatus(csSeeker({locT:now-(C.CFG.locFresh+20)*1000}),{h:csHider(3)},now,20);
+  return eq(r.why,'you');});
+t('with nobody left to catch it says exactly that',()=>
+  eq(C.catchStatus(csSeeker(),{},now,20).why,'none'));
+t('seekers are not offered each other',()=>
+  eq(C.catchStatus(csSeeker(),{o:csHider(3,{id:'o',role:'seeker'})},now,20).why,'none'));
+t('an already caught player is not offered again',()=>
+  eq(C.catchStatus(csSeeker(),{h:csHider(3,{caught:true})},now,20).why,'none'));
+t('a hider is never offered a catch button',()=>
+  eq(C.catchStatus(csSeeker({role:'hider'}),{h:csHider(3)},now,20).why,'notseeker'));
+t('poor accuracy widens the reach rather than blocking the catch',()=>{
+  const r=C.catchStatus(csSeeker({acc:45}),{h:csHider(35,{acc:45})},now,20);
+  return ok(r.ok,'reach was only '+r.reach+' for '+r.dist+' m');});
+
+/* ---- leaving the circle ---- */
+const zone={lat:O.lat,lng:O.lng,r:100};
+const outsideAt=(m,since)=>{const p=C.offsetLatLng(O,m,0);
+  return {lat:p.lat,lng:p.lng,outsideSince:since};};
+t('inside the circle is never out',()=>
+  ok(!C.zoneVerdict(outsideAt(10,null),zone,now).out));
+t('standing outside past the grace puts you out',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneOut:15}));
+  return ok(C.zoneVerdict(outsideAt(300,now-20000),zone,now).out);});
+t('a moment outside during the grace does not',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneOut:15}));
+  const v=C.zoneVerdict(outsideAt(300,now-3000),zone,now);
+  return ok(!v.out&&v.left>10);});
+t('out at once means the first tick outside',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneOut:0}));
+  return ok(C.zoneVerdict(outsideAt(300,now),zone,now).out);});
+t('never out keeps the old warning-only behaviour',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneOut:-1}));
+  const v=C.zoneVerdict(outsideAt(300,now-600000),zone,now);
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(v.outside&&!v.out);});
+t('the countdown counts down',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneOut:15}));
+  const a=C.zoneVerdict(outsideAt(300,now-2000),zone,now).left;
+  const b=C.zoneVerdict(outsideAt(300,now-9000),zone,now).left;
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(a>b);});
+
+/* ---- getting back into a match ---- */
+t('your own id gets your own seat',()=>
+  eq(C.rejoinSlot({me:{name:'LACHY'}},'me','LACHY',now),'me'));
+t('a reloaded phone with a new id takes back its old seat by name',()=>
+  eq(C.rejoinSlot({old:{name:'LACHY',online:0}},'brandnew','LACHY',200000),'old'));
+t('a name that is still actively playing is not stolen',()=>
+  eq(C.rejoinSlot({live:{name:'LACHY',online:200000}},'brandnew','LACHY',200000),null));
+t('case does not stop you getting back in',()=>
+  eq(C.rejoinSlot({old:{name:'LACHY',online:0}},'x','lachy',200000),'old'));
+t('a stranger does not inherit somebody else’s seat',()=>
+  eq(C.rejoinSlot({old:{name:'LACHY',online:0}},'x','MAYA',200000),null));
+t('a bot seat is never handed to a person',()=>
+  eq(C.rejoinSlot({b:{name:'LACHY',online:0,bot:true}},'x','LACHY',200000),null));
+
+/* ---- a phone that has gone quiet ---- */
+t('a fresh position is not stale',()=>ok(!C.isStale({locT:now-2000},now)));
+t('a position from a minute ago is stale',()=>ok(C.isStale({locT:now-60000},now)));
+t('a player who never reported at all reads as infinitely old',()=>
+  eq(C.fixAge({},now),Infinity));
+
+/* ---- more than one seeker ---- */
+t('the host can start a match with two seekers',()=>{
+  const r=C.assignRoles(['a','b','c','d','e'],C.mulberry32(4),1,null,2);
+  return eq(r.seekerIds.length,2);});
+t('three seekers is three seekers',()=>{
+  const r=C.assignRoles(['a','b','c','d','e'],C.mulberry32(4),1,null,3);
+  return eq(Object.keys(r.roles).filter(k=>r.roles[k]==='seeker').length,3);});
+t('there is always somebody left to hunt',()=>{
+  const r=C.assignRoles(['a','b'],C.mulberry32(4),1,null,4);
+  return eq(Object.keys(r.roles).filter(k=>r.roles[k]==='hider').length,1);});
+t('volunteers fill the seeker seats first',()=>{
+  const r=C.assignRoles(['a','b','c','d','e'],C.mulberry32(9),1,['d','e'],2);
+  return ok(r.seekerIds.indexOf('d')>=0&&r.seekerIds.indexOf('e')>=0);});
+t('one volunteer for two seats gets a random partner',()=>{
+  const r=C.assignRoles(['a','b','c','d','e'],C.mulberry32(9),1,['d'],2);
+  return ok(r.seekerIds.length===2&&r.seekerIds.indexOf('d')>=0);});
+t('the imposter is never one of several seekers',()=>{
+  for(let i=0;i<60;i++){
+    const r=C.assignRoles(['a','b','c','d','e'],C.mulberry32(i),1,null,3);
+    if(r.seekerIds.indexOf(r.imposterId)>=0) throw new Error('seed '+i+' made a seeker the imposter');
+  }
+  return true;});
 
 /* ---- volunteering to seek ---- */
 const IDS=['a','b','c','d','e'];

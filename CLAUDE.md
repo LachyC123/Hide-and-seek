@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  315 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  347 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -49,8 +49,11 @@ test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
    as a sentence a person would say. `npm test` before you call anything done.
 4. Vanilla ES5-flavoured JS, `var`, no frameworks, no build tooling beyond `build.js`. It has
    to stay one file that works from a static host.
-5. **No `localStorage` / `sessionStorage`.** Persistence goes through `window.storage` when
-   present, and every call is wrapped so the game still runs when it isn't.
+5. **Persistence goes through `STORE`**, which prefers the host page's `window.storage`, falls
+   back to `localStorage`, and finally to memory. The old rule was "never localStorage", written
+   when a host page always injected `window.storage`; on a static host there is no such thing,
+   so the player id was regenerated every load and **nobody could ever rejoin a match**. Never
+   call `localStorage` directly — `STORE` is the wrapper that survives it being blocked.
 6. Prefer adding to the DEV panel over adding temporary debug UI. It already covers every
    phase jump, forced win, catch, vote and zone move. It is hidden unless the URL carries
    `#dev`, so the smoke tests that drive the game through it load the page with that flag —
@@ -103,7 +106,18 @@ Break any of these and the game stops making sense:
   backing store to the device ratio.
 - Smoothing stays off for the game layer, which is pixel art, and on for map tiles, which are
   photographs. Turning it off globally makes every upscaled tile blocky.
-- Catch validation requires fresh location on both sides, correct roles, and the GPS allowance.
+- Catch validation requires fresh location on both sides, correct roles, and the GPS allowance —
+  but the tolerances have to suit real phones, not ideal ones. Two handsets at ±10 m read 20 m
+  apart while their owners are touching, which is why `catchRadius` defaults to 20 and `locFresh`
+  to 45 s. `catchStatus` exists so a seeker is never just told nothing: it names the nearest
+  hider and why the button is missing.
+- **The manual catch (`claim`) is the guarantee and takes no distance or freshness check.** A
+  seeker saying "I tagged them" outranks the satellites; without it the game has a failure mode
+  where nothing works and nobody can do anything about it.
+- The GPS filter may never reject indefinitely — three refusals in a row and it takes whatever
+  the phone offers. A rejected fix means that player is frozen on everyone else's map.
+- A player whose phone has gone quiet is drawn faded with LAST SEEN, never hidden. Vanishing is
+  worse than being out of date: people were simply missing from the map.
 - Anything a player is told to physically walk to — objectives, the imposter's lure spot, bot
   spawns — goes through `reachableSpot`, so it lands on a real street when road data exists.
   Every one of those callers must still work when it doesn't; `roadPointNear` returns null and
@@ -193,7 +207,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           315 core tests + 7 smoke runs
+npm test           347 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

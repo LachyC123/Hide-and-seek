@@ -123,6 +123,10 @@ input:focus{outline:none;border-color:var(--accent)}
 .rcell.seeking i{color:var(--amber)}
 .rcell.lost i{color:var(--ember)}
 
+/* zoom controls sit in the HUD chip row; the HUD itself ignores taps, so these opt back in */
+.chip.zoom{pointer-events:auto;cursor:pointer;min-width:34px;justify-content:center;text-align:center}
+.chip.zoom b{font-size:17px;line-height:1}
+
 /* multiplayer setup */
 /* body sets user-select:none for the game; these have to opt back in, and iOS only
    honours the -webkit- form — without it the block cannot be selected by hand at all */
@@ -438,11 +442,16 @@ input:focus{outline:none;border-color:var(--accent)}
         <div class="chip"><u>Left</u><b class="mono" id="hLeft">-</b></div>
         <div class="chip" id="hGpsChip"><u>GPS</u><b class="mono" id="hGps">--</b></div>
         <div class="chip hidden" id="hNetChip"><u>Room</u><b class="mono" id="hNet">--</b></div>
+        <div class="chip zoom" id="hZoomOut"><b>&#8722;</b></div>
+        <div class="chip zoom" id="hZoomIn"><b>+</b></div>
       </div>
       <div class="spacer"></div>
       <div class="hudbottom">
         <div class="card hidden" id="taskCard"><h4 id="taskTitle"></h4><p id="taskBody"></p><div class="bar hidden" id="taskBar"><i></i></div></div>
+        <p id="catchnote" class="tiny" style="text-transform:none;letter-spacing:.02em;font-size:12px;
+          margin:0 0 6px;text-align:center;color:var(--amber);pointer-events:none"></p>
         <button class="btn hidden" id="catchbtn">Catch</button>
+        <button class="btn dark small hidden" id="manualbtn">I caught someone</button>
         <button class="btn hidden" id="tipbtn">Send secret tip</button>
         <button class="btn ghost small hidden" id="hostbtn">Host controls</button>
       </div>
