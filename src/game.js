@@ -23,7 +23,7 @@ var CFG={
   fullSignal:{1:60,2:90}, zoneStages:5, zoneShrink:0.66, zoneMinR:45,
   zonePreview:150, zoneClose:45, graceOutside:45, tribunals:2,
   missionFollowRadius:25, missionFollowTime:30, objectiveRadius:20, objectiveTime:15,
-  trackScale:1, objectives:1, mapStyle:'real',
+  trackScale:1, trackRate:1, hiderSight:1, objectives:1, mapStyle:'real',
   // GPS handling
   gpsForgive:1, catchSlop:0.5, catchSlopMax:15, maxAcc:65, maxSpeed:12, gpsQ:1.6,
   // multiplayer presence: a phone that stops reporting is stale, then lost
@@ -34,8 +34,8 @@ var CFG={
 var DEFAULTS=JSON.parse(JSON.stringify(CFG));
 function applyCfg(c){
   if(!c) return CFG;
-  ['scatter','catchRadius','conversion','zoneStages','tribunals','trackScale','objectives',
-   'gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
+  ['scatter','catchRadius','conversion','zoneStages','tribunals','trackScale','trackRate',
+   'hiderSight','objectives','gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
   if(c.zoneShrink!==undefined) CFG.zoneShrink=clampN(c.zoneShrink,0.4,0.95);
   if(c.fullSignal!==undefined){ CFG.fullSignal={1:c.fullSignal,2:c.fullSignal+30}; }
   return CFG;
@@ -43,8 +43,8 @@ function applyCfg(c){
 function clampN(v,a,b){return v<a?a:v>b?b:v;}
 function sanitiseCfg(c){
   var d={matchLen:1800,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
-    fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,objectives:1,
-    gpsForgive:1,mapStyle:'real'};
+    fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
+    hiderSight:1,objectives:1,gpsForgive:1,mapStyle:'real'};
   c=c||{};
   var o={
     matchLen:clampN(+c.matchLen||d.matchLen,600,5400),
@@ -58,6 +58,9 @@ function sanitiseCfg(c){
     zoneShrink:clampN(+c.zoneShrink||d.zoneShrink,0.4,0.95),
     tribunals:clampN(c.tribunals===undefined?d.tribunals:+c.tribunals,0,2),
     trackScale:clampN(+c.trackScale||d.trackScale,0.4,2.5),
+    // 0 is a real choice here, not a missing value: it means seekers get no routine signals
+    trackRate:clampN(c.trackRate===undefined?d.trackRate:+c.trackRate,0,2),
+    hiderSight:(c.hiderSight===undefined?d.hiderSight:(c.hiderSight?1:0)),
     objectives:(c.objectives===undefined?d.objectives:(c.objectives?1:0)),
     gpsForgive:(c.gpsForgive===undefined?d.gpsForgive:(c.gpsForgive?1:0)),
     mapStyle:(c.mapStyle==='pixel'?'pixel':'real')
@@ -120,6 +123,31 @@ function trackingBand(progress){
   if(progress<0.33) return {min:150,max:200,every:45};
   if(progress<0.66) return {min:80,max:120,every:35};
   return {min:40,max:70,every:25};
+}
+/* How long between one hider's routine signals. 0 means the host never emits them at
+   all, so seekers only ever see a hider during full signal or a long zone violation. */
+function signalGap(progress,rate){
+  rate=(rate===undefined?CFG.trackRate:rate);
+  if(!(rate>0)) return 0;
+  return trackingBand(progress).every/rate;
+}
+/* The single rule for whether one player's marker is drawn on another's map. */
+function sees(mine,p,st,nowMs){
+  if(!mine||!p) return false;
+  if(mine.id===p.id) return true;
+  if(mine.role==='seeker'){
+    if(p.role==='seeker') return true;                 // seekers coordinate
+    if(p.caught) return true;                          // just-caught players
+    if(nowMs<((st&&st.fullSignalUntil)||0)) return true;
+    if(nowMs<(p.liveUntil||0)) return true;            // sustained zone violation
+    return false;
+  }
+  if(p.role==='seeker') return false;                  // hiders never see seekers
+  if(CFG.hiderSight) return true;                      // teammates, by name
+  // Knowing where everyone is IS the imposter's power — the risk is being seen doing the
+  // missions that turn it into something the seekers can use. An exposed imposter has lost
+  // their powers and from then on sees exactly what an ordinary hider sees.
+  return !!(st&&st.imposterEligible&&mine.id===st.imposterId);
 }
 function makeBlip(rng,pos,progress,jammed){
   var b=trackingBand(progress);
@@ -764,6 +792,7 @@ function ROAD_STYLE(k){
 var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetLatLng,CFG:CFG,
   schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,nextZone:nextZone,
   zoneContains:zoneContains,zoneStageTimes:zoneStageTimes,trackingBand:trackingBand,makeBlip:makeBlip,
+  signalGap:signalGap,sees:sees,
   canCatch:canCatch,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
   factionCounts:factionCounts,checkWin:checkWin,outsideState:outsideState,pickMission:pickMission,
   missionTick:missionTick,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
@@ -810,8 +839,8 @@ var G={
   render:{},             // interpolated sprite positions
   bots:[], dev:false, simMove:false,
   cfg:{matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
-       fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,objectives:1,
-       gpsForgive:1,mapStyle:'real'},
+       fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
+       hiderSight:1,objectives:1,gpsForgive:1,mapStyle:'real'},
   mp:null,               // {url,key} — Supabase project, from the join link or setup screen
   ack:0,                 // highest action seq the host has confirmed
   dropped:{},            // host-side: ids pruned from the lobby, and the row that did it
@@ -1187,10 +1216,14 @@ function hostSim(){
   var band=trackingBand(clamp(hc/s.end,0,1));
   var jam=n<st.jammedUntil;
   st.blips=(st.blips||[]).filter(function(b){return b.until>n;});
+  var gap=signalGap(clamp(hc/s.end,0,1));
   Object.keys(st.players).forEach(function(id){
     var p=st.players[id];
     if(p.role==='seeker'||p.caught||p.lat==null) return;
-    var every=(n<p.exposedUntil)?12:band.every;
+    // Being outside the zone always gives you away, even with routine signals turned off —
+    // that is the punishment for it, not a tracking feature.
+    var every=(n<p.exposedUntil)?12:gap;
+    if(!every) return;
     if(n-(p.lastBlip||0)>every*1000){
       p.lastBlip=n;
       var b=makeBlip(mulberry32((st.seed+n)|0),p,clamp(hc/s.end,0,1),jam);
@@ -1822,18 +1855,7 @@ function label(x,y,txt,col,size){
   ctx.fillRect(x-w/2,y-(size||9)-2,w,(size||9)+6);
   ctx.fillStyle=col||'#f2ecdf'; ctx.fillText(txt,x,y+1);
 }
-function visibleTo(mine,p,st){
-  if(p.id===G.me.id) return true;
-  var n=now();
-  if(mine.role==='seeker'){
-    if(p.role==='seeker') return true;                       // seekers coordinate
-    if(p.caught) return true;                                // just-caught players
-    if(n<st.fullSignalUntil) return true;                    // FULL SIGNAL
-    if(n<(p.liveUntil||0)) return true;                      // long-term zone violation
-    return false;
-  }
-  return false;                                              // hiders/imposter see nobody
-}
+function visibleTo(mine,p,st){ return sees(mine,p,st,now()); }
 function drawPlayers(st){
   var mine=me(); if(!mine) return;
   var ids=Object.keys(st.players);
@@ -1858,7 +1880,9 @@ function drawPlayers(st){
     ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(s.x-4*S/2,s.y-2,4*S,2*S/2);
     var alpha=p.caught?0.5:1;
     drawChar(ctx,p.char,r.dir,r.moving?frame:0,S,s.x-7*S,s.y-18*S,alpha);
-    var col=p.id===G.me.id?'#43b0e8':(p.role==='seeker'?'#f2a63b':'#f2ecdf');
+    var col=p.id===G.me.id?'#43b0e8'
+      :p.role==='seeker'?'#f2a63b'
+      :(mine.role!=='seeker'?'#63c77c':'#f2ecdf');    // green: on your side
     label(s.x,s.y-19*S,p.name.toUpperCase(),col,9);
     if(p.caught) label(s.x,s.y+10,'CAUGHT','#e8503a',8);
   });
@@ -2745,13 +2769,22 @@ var SETUP=[
    h:'On: adds a little slack when phone accuracy is poor, so real tags are not refused.'},
   {k:'conversion',t:'Time to turn seeker',type:'range',min:10,max:180,step:5,
    fmt:function(v){return v+'s';},h:'Grace period after being caught, so nobody gets chain-caught.'},
-  {k:'trackScale',t:'Seeker signals',type:'seg',opts:[[1.4,'Loose'],[1,'Normal'],[0.6,'Tight']],
+  {k:'trackScale',t:'Signal accuracy',type:'seg',opts:[[1.4,'Loose'],[1,'Normal'],[0.6,'Tight']],
    h:'How precise the blips on a seeker map are. Tight makes hiding much harder.'},
+  {k:'trackRate',t:'How often hiders show up',type:'range',min:0,max:2,step:0.25,
+   fmt:function(v){return v>0?('about every '+Math.round(35/v)+'s'):'never';},
+   h:'How often a hider gives away a rough position to the seekers. At "never" the seekers '+
+     'only ever see someone during full signal or after a long time outside the zone — pure '+
+     'hide and seek, and much harder for them.'},
   {sec:'The zone'},
   {k:'zoneStages',t:'Zone moves',type:'range',min:0,max:8,step:1,
    fmt:function(v){return v===0?'never':v+'×';},h:'How many times the safe circle shrinks and relocates.'},
   {k:'zoneShrink',t:'Shrink per move',type:'range',min:0.4,max:0.95,step:0.05,
    fmt:function(v){return Math.round(v*100)+'%';},h:'Each new circle is this fraction of the last one.'},
+  {k:'hiderSight',t:'Hiders see each other',type:'seg',opts:[[1,'On'],[0,'Off']],
+   h:'On: hiders see other hiders on the map by name, so you can regroup and it is obvious '+
+     'who is left. Off: every hider is on their own — but the imposter can still see everyone, '+
+     'which is exactly what makes them dangerous.'},
   {sec:'Imposter & voting'},
   {k:'imposters',t:'Imposter',type:'seg',opts:[[1,'1 imposter'],[0,'None']],
    h:'Off turns the game into a plain manhunt. Needs 3+ players.'},
@@ -2932,7 +2965,8 @@ function withCanvas(pctx,w,h,view,fn,dpr){
   try{ fn(); } finally { ctx=oc; VW=ow; VH=oh; G.view=ov; DPR=od; }
 }
 var PV_MODE={matchLen:'area',areaR:'area',scatter:'run',catchRadius:'catch',gpsForgive:'catch',
-  conversion:'run',trackScale:'signal',zoneStages:'zones',zoneShrink:'zones',
+  conversion:'run',trackScale:'signal',trackRate:'signal',hiderSight:'area',
+  zoneStages:'zones',zoneShrink:'zones',
   imposters:'area',tribunals:'area',fullSignal:'run',objectives:'area',mapStyle:'area'};
 function pvRing(c,r,col,dash,width){
   ctx.save(); if(dash) ctx.setLineDash(dash);
@@ -3027,8 +3061,12 @@ function drawPreview(){
       var S3=clamp(Math.round((1.8/mpp)/18),1,3);
       drawChar(ctx,G.me.char,'S',0,S3,os.x-7*S3,os.y-18*S3);
       ctx.fillStyle='#e8503a'; ctx.fillRect(mid.x-3,mid.y-3,6,6);
-      cap='Seeker signal · about '+Math.round(unc)+' m';
-      sub='A mid-game blip only narrows you down to this circle — '+paceText(unc)+' from the middle to the edge. The seeker still has to search it.';
+      var gap=signalGap(0.5,cfg.trackRate);
+      cap=gap?('Seeker signal · about '+Math.round(unc)+' m, every '+Math.round(gap)+'s')
+             :'Seeker signals · off';
+      sub=gap?('A mid-game blip only narrows you down to this circle — '+paceText(unc)+
+               ' from the middle to the edge, once every '+Math.round(gap)+' seconds. The seeker still has to search it.')
+             :'Seekers get no routine signals at all. They only see a hider during full signal, or after someone has been outside the zone for a while.';
     }
     pvScaleBar(mpp);
   },dpr);
@@ -3048,7 +3086,9 @@ function rulesSummary(c){
   var bits=[Math.round(c.matchLen/60)+' min',c.areaR+' m area',mmss(c.scatter)+' head start',
     c.catchRadius+' m catch',(c.imposters?'1 imposter':'no imposter'),
     (c.tribunals?c.tribunals+' vote'+(c.tribunals>1?'s':''):'no votes'),
-    (c.zoneStages?c.zoneStages+' zone moves':'zone never moves')];
+    (c.zoneStages?c.zoneStages+' zone moves':'zone never moves'),
+    (c.trackRate>0?'signal every '+Math.round(35/c.trackRate)+'s':'no seeker signals'),
+    (c.hiderSight?'hiders see each other':'hiders are alone')];
   return bits.join(' · ');
 }
 
@@ -3097,8 +3137,8 @@ function boot(){
   };
   $('#b-reset-rules').onclick=function(){
     G.cfg={matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
-      fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,objectives:1,
-      gpsForgive:1,mapStyle:'real'};
+      fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
+      hiderSight:1,objectives:1,gpsForgive:1,mapStyle:'real'};
     buildSetup(); pvFocus('areaR'); SFX.ok();
   };
   $('#b-create').onclick=function(){ SFX.tap(); buildSetup();

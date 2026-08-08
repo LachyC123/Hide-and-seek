@@ -23,8 +23,16 @@ setTimeout(()=>{
     drag('Catch distance',22); out.push(cap());
     drag('Head start',180); out.push(cap());
     drag('Zone moves',6); out.push(cap());
-    [...row('Seeker signals').querySelectorAll('button')].find(b=>b.textContent==='Tight').click();
+    [...row('Signal accuracy').querySelectorAll('button')].find(b=>b.textContent==='Tight').click();
     out.push(cap());
+    // how often hiders give themselves away, including turning it off entirely
+    drag('How often hiders show up',0.5); out.push(cap());
+    drag('How often hiders show up',0);   out.push(cap());
+    if(cap().indexOf('off')<0&&cap().indexOf('no routine signals')<0)
+      errors.push('turning signals off is not reflected in the preview: '+cap());
+    drag('How often hiders show up',1);
+    [...row('Hiders see each other').querySelectorAll('button')].find(b=>b.textContent==='Off').click();
+    out.push('hiders-see-each-other row present and switchable');
     drag('Time to turn seeker',90); out.push(cap());
     out.push('focused row highlighted: '+(row('Time to turn seeker').className.indexOf('focus')>=0));
     out.push('canvas ops fired: '+calls.length);

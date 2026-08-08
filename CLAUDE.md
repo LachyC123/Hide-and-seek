@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  242 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  266 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -66,8 +66,17 @@ Break any of these and the game stops making sense:
   stays in the game as an ordinary hider and can win with the hiders.
 - Nobody is ever eliminated. Caught players convert to seekers after a grace period so they
   can't be chain-caught.
-- Hiders see no other players. Seekers see other seekers, plus hiders only during FULL SIGNAL
-  or a sustained zone violation. The imposter gets no omniscience.
+- `sees` is the only place that decides whether one player's marker appears on another's map.
+  Seekers see other seekers, plus hiders only during FULL SIGNAL, a sustained zone violation, or
+  the moment of a catch. Hiders never see seekers. Hiders see each other when `hiderSight` is on.
+- **The imposter always sees the hiders while `imposterEligible`, and that is the point of the
+  role** — knowing where everyone is is their power; the risk is being seen doing the missions
+  that turn it into something the seekers can act on. It is not omniscience to be fixed. An
+  exposed imposter loses that sight with the rest of their powers and sees what a hider sees.
+  Their marker must stay indistinguishable from any other hider's, or the role is dead.
+- How often a hider gives themselves away is `signalGap`, host-tunable down to never. Being
+  outside the zone still exposes you with signals off — that is the punishment for it, not a
+  tracking feature.
 - Blips are approximate and tighten over the match; they never pin a hider exactly.
 - Canvases are sized to `window.devicePixelRatio` (up to 3x) and tile zoom is chosen for that
   density, not for CSS pixels. Drawing the map through a reduced-size buffer, or capping the
@@ -164,7 +173,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           242 core tests + 7 smoke runs
+npm test           266 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

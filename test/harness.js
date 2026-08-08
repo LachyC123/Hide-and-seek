@@ -884,6 +884,70 @@ t('connection details survive characters that need escaping',()=>{
   const mp={url:'https://a-b.supabase.co',key:'ab+/=cd'.repeat(6)};
   return eq(C.decodeMpConfig(C.encodeMpConfig(mp)).key,mp.key);});
 
+/* ---- who can see whom ---- */
+const vSeeker={id:'s1',role:'seeker'}, vSeeker2={id:'s2',role:'seeker'};
+const vHider={id:'h1',role:'hider'}, vHider2={id:'h2',role:'hider'};
+const vImp={id:'i1',role:'imposter'};
+const room=(over)=>Object.assign({fullSignalUntil:0,imposterId:'i1',imposterEligible:true},over||{});
+const withSight=(on,fn)=>{const was=C.CFG.hiderSight;C.CFG.hiderSight=on;
+  try{return fn();}finally{C.CFG.hiderSight=was;}};
+
+t('everyone can always see themselves',()=>
+  ok(C.sees(vHider,{id:'h1',role:'hider'},room(),0)));
+t('a hider never sees a seeker, whatever the setting',()=>
+  ok(withSight(1,()=>!C.sees(vHider,vSeeker,room(),0))&&
+     withSight(0,()=>!C.sees(vHider,vSeeker,room(),0))));
+t('with the setting on, hiders see each other',()=>
+  ok(withSight(1,()=>C.sees(vHider,vHider2,room(),0))));
+t('with the setting off, a hider is on their own',()=>
+  ok(withSight(0,()=>!C.sees(vHider,vHider2,room(),0))));
+t('the imposter sees the hiders even when nobody else can',()=>
+  ok(withSight(0,()=>C.sees(vImp,vHider,room(),0))));
+t('an exposed imposter loses that sight along with their other powers',()=>
+  ok(withSight(0,()=>!C.sees(vImp,vHider,room({imposterEligible:false}),0))));
+t('an exposed imposter still sees what an ordinary hider sees',()=>
+  ok(withSight(1,()=>C.sees(vImp,vHider,room({imposterEligible:false}),0))));
+t('the imposter is still blind to seekers, like any hider',()=>
+  ok(withSight(0,()=>!C.sees(vImp,vSeeker,room(),0))));
+t('seekers always see each other',()=>ok(C.sees(vSeeker,vSeeker2,room(),0)));
+t('seekers cannot see a hider going about their business',()=>
+  ok(withSight(1,()=>!C.sees(vSeeker,vHider,room(),0))));
+t('full signal shows every hider to every seeker',()=>
+  ok(C.sees(vSeeker,vHider,room({fullSignalUntil:5000}),1000)));
+t('full signal stops mattering once it has expired',()=>
+  ok(!C.sees(vSeeker,vHider,room({fullSignalUntil:5000}),6000)));
+t('a hider who has camped outside the zone is visible to seekers',()=>
+  ok(C.sees(vSeeker,{id:'h1',role:'hider',liveUntil:9000},room(),1000)));
+t('a just-caught hider is visible to the seekers who caught them',()=>
+  ok(C.sees(vSeeker,{id:'h1',role:'hider',caught:true},room(),0)));
+t('hiders seeing each other never leaks who the imposter is',()=>{
+  // the imposter's marker has to be indistinguishable from any other hider's
+  const asHider=withSight(1,()=>C.sees(vHider,vHider2,room(),0));
+  const asImp=withSight(1,()=>C.sees(vHider,{id:'i1',role:'imposter'},room(),0));
+  return eq(asHider,asImp);});
+
+/* ---- how often seekers get a signal ---- */
+t('the normal rate is the rate the match was always tuned to',()=>
+  eq(C.signalGap(0.5,1),C.trackingBand(0.5).every));
+t('a higher rate means signals arrive more often',()=>
+  ok(C.signalGap(0.5,2)<C.signalGap(0.5,1)));
+t('a lower rate means longer between signals',()=>
+  ok(C.signalGap(0.5,0.5)>C.signalGap(0.5,1)));
+t('turning signals off means no routine signal ever',()=>
+  ok(C.signalGap(0.1,0)===0&&C.signalGap(0.5,0)===0&&C.signalGap(0.9,0)===0));
+t('a negative or junk rate is treated as off rather than as an error',()=>
+  ok(C.signalGap(0.5,-1)===0&&C.signalGap(0.5,null)===0));
+t('signals still get more frequent as the match wears on',()=>
+  ok(C.signalGap(0.9,1)<C.signalGap(0.1,1)));
+t('the rate survives being saved with the rest of the rules',()=>{
+  const c=C.sanitiseCfg({trackRate:0,hiderSight:0});
+  return ok(c.trackRate===0&&c.hiderSight===0);});
+t('an absurd rate is clamped rather than making the match unplayable',()=>
+  ok(C.sanitiseCfg({trackRate:99}).trackRate===2&&C.sanitiseCfg({trackRate:-5}).trackRate===0));
+t('rules left unset still come back with sensible signal defaults',()=>{
+  const c=C.sanitiseCfg({});
+  return ok(c.trackRate===1&&c.hiderSight===1);});
+
 t('a denser screen is given a more detailed map, not a stretched one',()=>{
   const mpp=4;
   const at1=C.zoomForMpp(O.lat,mpp), at2=C.zoomForMpp(O.lat,mpp/2), at3=C.zoomForMpp(O.lat,mpp/3);
