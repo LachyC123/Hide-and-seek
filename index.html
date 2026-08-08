@@ -124,6 +124,15 @@ input:focus{outline:none;border-color:var(--accent)}
 /* multiplayer setup */
 /* body sets user-select:none for the game; these have to opt back in, and iOS only
    honours the -webkit- form — without it the block cannot be selected by hand at all */
+/* paused overlay: has to be unmistakable from a pocket's distance */
+#paused{position:fixed;inset:0;z-index:96;background:#0b0916f2;display:flex;
+  flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:28px;
+  text-align:center}
+#paused.hidden{display:none}
+#paused h1{font-size:38px;margin:2px 0;color:var(--amber);letter-spacing:.04em}
+#paused p{margin:0;max-width:300px}
+#paused .btn{max-width:320px;margin-top:14px}
+
 .sqlbox{background:var(--deep);color:#6ee7c0;font:10px/1.45 ui-monospace,Menlo,monospace;
   padding:10px;margin:6px 0 0;white-space:pre;overflow:auto;max-height:200px;
   -webkit-user-select:all;user-select:all;
@@ -418,6 +427,7 @@ input:focus{outline:none;border-color:var(--accent)}
         <div class="card hidden" id="taskCard"><h4 id="taskTitle"></h4><p id="taskBody"></p><div class="bar hidden" id="taskBar"><i></i></div></div>
         <button class="btn hidden" id="catchbtn">Catch</button>
         <button class="btn hidden" id="tipbtn">Send secret tip</button>
+        <button class="btn ghost small hidden" id="hostbtn">Host controls</button>
       </div>
     </div>
   </section>
@@ -491,6 +501,13 @@ input:focus{outline:none;border-color:var(--accent)}
 
 <div id="edge"></div>
 <div id="alert"><div class="sub" id="alertSub"></div><h1 id="alertTitle"></h1><p id="alertBody"></p></div>
+<div id="paused" class="hidden">
+  <div class="tiny">Match paused</div>
+  <h1>STAND STILL</h1>
+  <p id="pausedBy">The host has paused the game.</p>
+  <p class="tiny mono" id="pausedFor">0:00</p>
+  <button class="btn hidden" id="b-resume">Resume match</button>
+</div>
 <div id="devtab">DEV</div>
 <div id="dev"></div>
 <script>
@@ -855,6 +872,47 @@ function lostHiders(players,nowMs){
   });
 }
 function hostAlive(st,nowMs){ return !!st&&(nowMs-(st.hostAt||0))<CFG.hostTimeout*1000; }
+
+/* --- pausing ------------------------------------------------------------
+   Almost every deadline in a match is a wall-clock stamp, so a pause cannot just
+   stop a counter — on resume, everything that was due has to move forward by the
+   time nobody was playing. Miss one and it fires the instant play restarts. */
+var DEADLINES=['fullSignalUntil','jammedUntil','missionNextAt','zoneCloseAt'];
+var PLAYER_DEADLINES=['convertAt','exposedUntil','liveUntil','outsideSince','online','lastBlip','locT'];
+function resumeShift(st,ms){
+  if(!st||!(ms>0)) return st;
+  var bump=function(o,k){ if(o&&typeof o[k]==='number'&&o[k]) o[k]+=ms; };
+  bump(st,'t0');
+  DEADLINES.forEach(function(k){ bump(st,k); });
+  if(st.tribunal) bump(st.tribunal,'endsAt');
+  if(st.closing) bump(st.closing,'at');
+  (st.blips||[]).forEach(function(b){ bump(b,'until'); });
+  Object.keys(st.players||{}).forEach(function(id){
+    var p=st.players[id];
+    PLAYER_DEADLINES.forEach(function(k){ bump(p,k); });
+  });
+  return st;
+}
+function isPaused(st){ return !!(st&&st.pausedAt); }
+
+/* --- host succession -----------------------------------------------------
+   Every phone reads the same room record, so they all compute the same heir and
+   only one of them acts. Bots cannot host, and neither can a phone that has itself
+   gone quiet. Nothing here needs a schema change: the new host writes the same row. */
+function hostHeir(st,nowMs){
+  if(!st||!st.players) return null;
+  var ids=Object.keys(st.players).filter(function(id){
+    var p=st.players[id];
+    return p&&!p.bot&&id!==st.hostId&&presence(p,nowMs)!=='lost';
+  });
+  ids.sort();
+  return ids.length?ids[0]:null;
+}
+function shouldClaimHost(st,meId,nowMs){
+  if(!st||!meId||st.phase==='RESULTS') return false;
+  if(hostAlive(st,nowMs)) return false;
+  return hostHeir(st,nowMs)===meId;
+}
 
 /* --- Supabase transport (plain REST, no SDK) --------------------------- */
 function supaRequest(mp,path,opts){
@@ -1230,6 +1288,7 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   reachableSpot:reachableSpot,
   newActions:newActions,mergePlayerInput:mergePlayerInput,pendingActions:pendingActions,
   presence:presence,presentVoters:presentVoters,lostHiders:lostHiders,hostAlive:hostAlive,
+  resumeShift:resumeShift,isPaused:isPaused,hostHeir:hostHeir,shouldClaimHost:shouldClaimHost,
   supaRequest:supaRequest,rpcFor:rpcFor,rpcLegacyFor:rpcLegacyFor,rpcDialect:rpcDialect,
   isMissingFn:isMissingFn,supaErrorText:supaErrorText,MP_SQL:MP_SQL,
   validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
@@ -1559,7 +1618,11 @@ function progress(){ var s=schedule(G.st.cfg); return clamp(huntClock(matchT())/
 
 function hostSim(){
   var st=G.st; if(!st||st.phase==='LOBBY'||st.phase==='RESULTS') return;
-  var n=now(), t=(n-st.t0)/1000, ph=phaseFor(t,st.cfg), hc=huntClock(t);
+  var n=now();
+  // While paused nothing moves: no clock, no zone, no bots, no catches. _last is kept
+  // current so the first tick after resuming is a normal-sized step, not a huge one.
+  if(isPaused(st)){ st._last=n; return; }
+  var t=(n-st.t0)/1000, ph=phaseFor(t,st.cfg), hc=huntClock(t);
   var dt=(n-(st._last||n))/1000; st._last=n; if(dt<=0) dt=0.001;
   var rng=mulberry32((st.seed+Math.floor(n/1000))|0);
 
@@ -1803,6 +1866,18 @@ function applyAction(st,pid,a){
     pushEvent(st,pid,'tipsent','TIP SENT','The seekers have no idea it came from you.');
   }
   if(a.type==='start'&&pid===st.hostId&&st.phase==='LOBBY') startMatch(st);
+  if(a.type==='pause'&&pid===st.hostId&&st.phase!=='LOBBY'&&st.phase!=='RESULTS'&&!st.pausedAt){
+    st.pausedAt=now();
+    pushEvent(st,'all','pause','MATCH PAUSED','Stop where you are. Nobody can be caught.');
+  }
+  if(a.type==='resume'&&pid===st.hostId&&st.pausedAt){
+    resumeShift(st,now()-st.pausedAt); st.pausedAt=null; st._last=now();
+    pushEvent(st,'all','resume','BACK ON','Go!');
+  }
+  if(a.type==='endnow'&&pid===st.hostId&&st.phase!=='RESULTS'){
+    if(st.pausedAt){ resumeShift(st,now()-st.pausedAt); st.pausedAt=null; }
+    endMatch(st,{winner:'stopped'});
+  }
 }
 
 function startMatch(st){
@@ -1954,6 +2029,26 @@ function pullState(){
   });
 }
 function netFail(e){ if(e&&e.message&&/no transport/.test(e.message)) G.mode='solo'; }
+/* The old host's phone is gone. Carry on from the last state it published rather than
+   ending everyone's match. Seeding lastSeq from st.ack is what stops the new host
+   re-applying every action still sitting in the other phones' outboxes. */
+function claimHost(){
+  var st=G.st; if(!st||G.isHost) return;
+  var gone=(st.players[st.hostId]||{}).name||'The host';
+  G.isHost=true; G.outbox=[]; G.ack=0;
+  st.hostId=G.me.id; st.hostAt=now(); st._last=now();
+  G.lastSeq={};
+  Object.keys(st.ack||{}).forEach(function(k){ G.lastSeq[k]=st.ack[k]; });
+  var mine=st.players[G.me.id]; if(mine) mine.online=now();
+  pushEvent(st,'all','host','MATCH RESCUED',gone+"'s phone dropped out. "+G.me.name+
+    ' is running the match now — carry on.');
+  G.flush=true;
+  toast('You are hosting now');
+}
+function hostWatch(){
+  if(G.mode!=='net'||G.isHost||!G.st||!G.code) return;
+  if(shouldClaimHost(G.st,G.me.id,now())) claimHost();
+}
 /* A client that cannot see the host is not "fine but quiet" — say so on screen. */
 function netStatus(){
   if(G.mode!=='net') return {s:'ok',t:'Solo'};
@@ -1961,7 +2056,8 @@ function netStatus(){
   var since=now()-(G.isHost?NET.lastOkAt:G.lastGoodPull);
   if(!NET.lastOkAt&&!G.lastGoodPull) return {s:'warn',t:'Connecting…'};
   if(since>15000) return {s:'bad',t:'Offline'};
-  if(!G.isHost&&G.st&&G.st.hostAt&&!hostAlive(G.st,now())) return {s:'bad',t:'Host quiet'};
+  if(!G.isHost&&G.st&&G.st.hostAt&&!hostAlive(G.st,now()))
+    return {s:'bad',t:shouldClaimHost(G.st,G.me.id,now())?'Taking over':'Host quiet'};
   if(since>6000) return {s:'warn',t:'Slow'};
   return {s:'ok',t:'Synced'};
 }
@@ -1980,12 +2076,48 @@ function netLoop(){
   setTimeout(netLoop,250);
 }
 
+/* ---------- keeping the phone awake ----------
+   A locked phone stops reporting its position, which makes that player impossible to
+   catch and invisible to everyone. The browser drops a wake lock every time the page
+   is hidden, so asking once at boot is close to useless — it has to be re-taken on
+   every return, and the room resynced immediately rather than at the next poll. */
+var WAKE={lock:null,want:false,granted:0,fails:0};
+function keepAwake(want){
+  if(want!==undefined) WAKE.want=!!want;
+  if(!WAKE.want||WAKE.lock) return;
+  if(!navigator.wakeLock||!navigator.wakeLock.request) return;
+  if(document.hidden) return;
+  try{
+    navigator.wakeLock.request('screen').then(function(l){
+      WAKE.lock=l; WAKE.granted++;
+      l.addEventListener('release',function(){ WAKE.lock=null; });
+    },function(){ WAKE.fails++; });
+  }catch(e){ WAKE.fails++; }
+}
+function releaseAwake(){
+  WAKE.want=false;
+  if(WAKE.lock){ try{ WAKE.lock.release(); }catch(e){} WAKE.lock=null; }
+}
+function onResume(){
+  keepAwake();
+  // a backgrounded tab has had its timers throttled: pull the room now, not in 1.5s
+  G.lastPush=0; G.flush=true; G.netBusy=false;
+  if(navigator.geolocation&&G.gps!=='virtual'){
+    try{ navigator.geolocation.getCurrentPosition(function(pos){
+      var raw={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy,t:now()};
+      var f=(GPSF&&GPSF.push(raw))||raw;
+      G.pos={lat:f.lat,lng:f.lng,acc:f.acc,t:now()};
+      pushLocalPos();
+    },function(){},{enableHighAccuracy:true,maximumAge:0,timeout:15000}); }catch(e){}
+  }
+}
+
 /* ---------- location ---------- */
 var GPSF=null;
 function startGPS(){
   if(!navigator.geolocation){ G.gps='virtual'; return; }
   GPSF=makeGpsFilter();
-  try{ if(navigator.wakeLock) navigator.wakeLock.request('screen').catch(function(){}); }catch(e){}
+  keepAwake();
   try{
     navigator.geolocation.watchPosition(function(pos){
       var raw={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy,t:now()};
@@ -2135,7 +2267,43 @@ function drawBlips(st){
     ctx.lineWidth=2; ctx.beginPath(); ctx.arc(s.x,s.y,r,0,6.2832); ctx.stroke();
     ctx.fillStyle=b.leak?'#a05ce0':'#e8503a';
     ctx.fillRect(s.x-3,s.y-3,6,6);
+    // how far away it is decides whether it is worth running at
+    if(G.pos) label(s.x,s.y+r+12,Math.round(metersBetween(G.pos,b))+' m',
+      b.leak?'#d3b6f5':'#f0a79a',8);
   });
+}
+
+/* Text alone is useless while running. An arrow that points at the circle, sized so
+   it is readable at arm's length, is the difference between "get back inside" being
+   an instruction and being a puzzle. */
+function drawGuide(st,z){
+  if(!G.pos) return;
+  var c=toScreen(z), d=metersBetween(G.pos,z), edge=Math.max(0,d-z.r);
+  var onScreen=(c.x>40&&c.x<VW-40&&c.y>60&&c.y<VH-90);
+  var outside=d>z.r;
+  if(!outside&&onScreen) return;                 // inside and can see it: nothing to say
+  var mx=VW/2, my=VH/2, ang=Math.atan2(c.y-my,c.x-mx);
+  var rad=Math.min(VW,VH)*0.34;
+  var ax=mx+Math.cos(ang)*rad, ay=my+Math.sin(ang)*rad;
+  var col=outside?'#f2a63b':'rgba(67,176,232,.85)';
+  ctx.save();
+  ctx.translate(ax,ay); ctx.rotate(ang);
+  ctx.fillStyle=col;
+  ctx.beginPath(); ctx.moveTo(14,0); ctx.lineTo(-10,-9); ctx.lineTo(-5,0); ctx.lineTo(-10,9);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+  label(ax,ay+26,outside?(Math.round(edge)+' m TO SAFETY'):(Math.round(d)+' m'),
+    outside?'#f2a63b':'#cfc7e0',outside?10:8);
+}
+function drawNorth(){
+  var x=VW-22,y=64;
+  ctx.save();
+  ctx.fillStyle='rgba(11,9,22,.6)'; ctx.fillRect(x-11,y-16,22,26);
+  ctx.fillStyle='#e8503a'; ctx.beginPath();
+  ctx.moveTo(x,y-12); ctx.lineTo(x-5,y-2); ctx.lineTo(x+5,y-2); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#cfc7e0'; ctx.font='900 8px Helvetica,Arial,sans-serif'; ctx.textAlign='center';
+  ctx.fillText('N',x,y+7);
+  ctx.restore();
 }
 function drawObjectives(st){
   var mine=me(); if(!mine||mine.role==='seeker') return;
@@ -2226,6 +2394,8 @@ function renderMap(){
   drawObjectives(st);
   if(isSeeker()) drawBlips(st);
   drawPlayers(st);
+  drawGuide(st,z);
+  drawNorth();
   // full signal wash
   if(now()<st.fullSignalUntil){
     ctx.fillStyle='rgba(232,80,58,'+(0.05+0.04*Math.sin(now()/200))+')';
@@ -2437,10 +2607,14 @@ function renderResults(){
   var st=G.st;
   var w=st.winner;
   mood(w==='imposter'?'imposter':w==='seekers'?'seeker':'calm');
-  $('#resTitle').textContent=w==='imposter'?'Imposter victory':w==='seekers'?'Seekers win':'Hiders win';
-  $('#resSub').textContent='Match over';
+  releaseAwake();
+  $('#resTitle').textContent=w==='imposter'?'Imposter victory':w==='seekers'?'Seekers win'
+    :w==='stopped'?'Match stopped':'Hiders win';
+  $('#resSub').textContent=w==='stopped'?'Called early':'Match over';
   $('#resLine').textContent=w==='imposter'?'They played everyone. The imposter turned the hunt against the hiders and was the last one standing.'
-    :w==='seekers'?'Every single hider was hunted down.':'The hiders outlasted the hunt.';
+    :w==='seekers'?'Every single hider was hunted down.'
+    :w==='stopped'?'The host ended the match early. Here is how far everyone got.'
+    :'The hiders outlasted the hunt.';
   if(w==='imposter'){SFX.glitch();buzz([100,60,100,60,300]);} else SFX.reveal();
   var L=$('#resList'); L.innerHTML='';
   Object.keys(st.players).forEach(function(id){
@@ -2542,6 +2716,25 @@ function updateHUD(){
     if(!G._catchBuzz){G._catchBuzz=1;buzz(60);}
   } else { cb.classList.add('hidden'); G._catchBuzz=0; }
 
+  // pause overlay — everyone sees it, only the host can lift it
+  var pv=$('#paused');
+  if(pv){
+    var paused=isPaused(st);
+    pv.classList.toggle('hidden',!paused);
+    if(paused){
+      var who=(st.players[st.hostId]||{}).name||'The host';
+      $('#pausedBy').textContent=G.isHost
+        ? 'You paused the game. Nobody can be caught and the zone is frozen.'
+        : who+' paused the game. Nobody can be caught and the zone is frozen.';
+      $('#pausedFor').textContent='paused for '+mmss((now()-st.pausedAt)/1000);
+      $('#b-resume').classList.toggle('hidden',!G.isHost);
+    }
+  }
+
+  // host controls
+  var hb=$('#hostbtn');
+  if(hb) hb.classList.toggle('hidden',!(G.isHost&&st.phase!=='RESULTS'&&!isPaused(st)));
+
   // tip button
   var tb=$('#tipbtn');
   if(p.id===st.imposterId&&st.imposterEligible&&st.tips>0&&!p.caught){
@@ -2562,6 +2755,15 @@ function updateHUD(){
       mood(danger?'danger':'calm');
     }
   }
+}
+function openHostMenu(){
+  modal('Host controls','You are running this match on your phone.',[
+    {label:'Pause the match',fn:function(){ act('pause'); SFX.alarm(); }},
+    {label:'End match now',fn:function(){
+      modal('End the match?','Everyone goes straight to the results. This cannot be undone.',
+        [{label:'Yes, end it',fn:function(){ act('endnow'); SFX.bad(); }}]);
+    }}
+  ]);
 }
 function openTipMenu(){
   var st=G.st;
@@ -2641,11 +2843,13 @@ function route(){
 var lastUpkeep=0;
 function logicTick(){
   if(G.st){
+    hostWatch();
     if(G.isHost){ pushLocalPos(); hostSim(); }
     drainEvents();
     route();
     if(CUR==='s-match') updateHUD();
-    if(now()-lastUpkeep>5000){ lastUpkeep=now(); streetsUpkeep(); }
+    if(now()-lastUpkeep>5000){ lastUpkeep=now(); streetsUpkeep(); keepAwake(); }
+    keepAwake(G.st.phase!=='RESULTS');
   }
   setTimeout(logicTick,250);
 }
@@ -2653,6 +2857,7 @@ function frame(){ if(CUR==='s-match') renderMap(); requestAnimationFrame(frame);
 
 /* ---------- creating / joining ---------- */
 function leaveRoom(){
+  releaseAwake();
   // tell the room straight away rather than making the host wait out the drop timer
   if(G.mode==='net'&&G.code&&!G.isHost) netDeleteInput(G.code,G.me.id);
   G.st=null; G.code=null; G.isHost=false; G.mode='solo'; roleShown=false;
@@ -2887,6 +3092,11 @@ function diagRows(){
   rows.push({s:gN?'ok':'warn',t:'Walkable roads',
     d:gN?(gN+' road and path segments are being used to place objectives and keep bots on the street.')
       :'No road network yet, so objectives fall back to open ground anywhere in the circle.'});
+  var awake=!!WAKE.lock;
+  rows.push({s:awake?'ok':(navigator.wakeLock?'warn':'warn'),t:'Screen stays awake',
+    d:awake?'Holding a wake lock, so the screen will not lock mid-match and stop your GPS.'
+      :!navigator.wakeLock?'This browser cannot keep the screen awake. Set your screen timeout to a few minutes before playing, or the phone will stop reporting your position.'
+      :'Not held right now — it is taken while a match is running and re-taken every time you come back to the page.'});
   var ns=netStatus();
   rows.push({s:NET.kind==='none'?'warn':ns.s,t:'Multiplayer',
     d:NET.kind==='none'?'No transport set up. Create game will only offer solo play — open Multiplayer setup to connect a Supabase project.'
@@ -3440,8 +3650,14 @@ function boot(){
     $('#b-vote-lock').textContent='Skipped'; $('#b-vote-lock').disabled=true; };
   $('#b-again').onclick=function(){ SFX.tap(); G.bots=[]; createGame(G.mode==='solo'); };
   $('#b-home').onclick=function(){ leaveRoom(); SFX.tap(); show('s-home'); };
+  $('#hostbtn').onclick=function(){ SFX.tap(); openHostMenu(); };
+  $('#b-resume').onclick=function(){ SFX.ok(); act('resume'); };
   $('#devtab').onclick=function(){ $('#dev').classList.toggle('show'); };
   $('#codeInput').addEventListener('input',function(){ this.value=this.value.toUpperCase(); });
+
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) onResume(); });
+  window.addEventListener('focus',onResume);
+  window.addEventListener('pageshow',onResume);
 
   logicTick(); netLoop(); requestAnimationFrame(frame);
   paintScene('welcomeScene');

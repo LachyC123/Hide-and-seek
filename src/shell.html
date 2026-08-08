@@ -124,6 +124,15 @@ input:focus{outline:none;border-color:var(--accent)}
 /* multiplayer setup */
 /* body sets user-select:none for the game; these have to opt back in, and iOS only
    honours the -webkit- form — without it the block cannot be selected by hand at all */
+/* paused overlay: has to be unmistakable from a pocket's distance */
+#paused{position:fixed;inset:0;z-index:96;background:#0b0916f2;display:flex;
+  flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:28px;
+  text-align:center}
+#paused.hidden{display:none}
+#paused h1{font-size:38px;margin:2px 0;color:var(--amber);letter-spacing:.04em}
+#paused p{margin:0;max-width:300px}
+#paused .btn{max-width:320px;margin-top:14px}
+
 .sqlbox{background:var(--deep);color:#6ee7c0;font:10px/1.45 ui-monospace,Menlo,monospace;
   padding:10px;margin:6px 0 0;white-space:pre;overflow:auto;max-height:200px;
   -webkit-user-select:all;user-select:all;
@@ -418,6 +427,7 @@ input:focus{outline:none;border-color:var(--accent)}
         <div class="card hidden" id="taskCard"><h4 id="taskTitle"></h4><p id="taskBody"></p><div class="bar hidden" id="taskBar"><i></i></div></div>
         <button class="btn hidden" id="catchbtn">Catch</button>
         <button class="btn hidden" id="tipbtn">Send secret tip</button>
+        <button class="btn ghost small hidden" id="hostbtn">Host controls</button>
       </div>
     </div>
   </section>
@@ -491,6 +501,13 @@ input:focus{outline:none;border-color:var(--accent)}
 
 <div id="edge"></div>
 <div id="alert"><div class="sub" id="alertSub"></div><h1 id="alertTitle"></h1><p id="alertBody"></p></div>
+<div id="paused" class="hidden">
+  <div class="tiny">Match paused</div>
+  <h1>STAND STILL</h1>
+  <p id="pausedBy">The host has paused the game.</p>
+  <p class="tiny mono" id="pausedFor">0:00</p>
+  <button class="btn hidden" id="b-resume">Resume match</button>
+</div>
 <div id="devtab">DEV</div>
 <div id="dev"></div>
 <script>

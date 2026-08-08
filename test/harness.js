@@ -665,6 +665,85 @@ t('a hider who is merely quiet is left alone',()=>
 t('a host that stopped writing is noticed',()=>
   ok(C.hostAlive({hostAt:100000},100000)&&!C.hostAlive({hostAt:0},100000)));
 
+/* ---- pausing ---- */
+const pausedState=()=>({
+  t0:100000, phase:'HUNT_1', pausedAt:null,
+  fullSignalUntil:150000, jammedUntil:0, missionNextAt:160000, zoneCloseAt:170000,
+  tribunal:{endsAt:180000,done:false}, closing:{at:120000},
+  blips:[{until:130000},{until:140000}],
+  players:{a:{convertAt:190000,exposedUntil:125000,liveUntil:0,outsideSince:110000,
+              online:115000,lastBlip:105000,locT:118000}}
+});
+t('a paused match is recognised however it is asked',()=>
+  ok(C.isPaused({pausedAt:5})&&!C.isPaused({pausedAt:null})&&!C.isPaused({})&&!C.isPaused(null)));
+t('resuming moves the match clock forward by the time nobody was playing',()=>{
+  const st=pausedState(); C.resumeShift(st,30000);
+  return eq(st.t0,130000);});
+t('every match deadline survives a pause',()=>{
+  const st=pausedState(); C.resumeShift(st,30000);
+  return ok(st.fullSignalUntil===180000&&st.missionNextAt===190000&&
+            st.zoneCloseAt===200000&&st.tribunal.endsAt===210000&&st.closing.at===150000);});
+t('a pause does not make every blip expire the moment play restarts',()=>{
+  const st=pausedState(); C.resumeShift(st,30000);
+  return ok(st.blips[0].until===160000&&st.blips[1].until===170000);});
+t('a caught player does not convert early because of a pause',()=>{
+  const st=pausedState(); C.resumeShift(st,30000);
+  return eq(st.players.a.convertAt,220000);});
+t('a pause does not make everyone look disconnected',()=>{
+  const st=pausedState(); C.resumeShift(st,300000);   // a five minute break
+  return ok(C.presence(st.players.a,415000)==='live');});
+t('a pause does not silently make someone outside the zone for ages',()=>{
+  const st=pausedState(); C.resumeShift(st,30000);
+  return eq(st.players.a.outsideSince,140000);});
+t('a deadline that was never set stays unset',()=>{
+  const st=pausedState(); C.resumeShift(st,30000);
+  return ok(st.jammedUntil===0&&st.players.a.liveUntil===0);});
+t('resuming with no elapsed time changes nothing',()=>{
+  const st=pausedState(), before=JSON.stringify(st);
+  C.resumeShift(st,0); C.resumeShift(st,-5);
+  return eq(JSON.stringify(st),before);});
+t('resuming a state with no tribunal or blips does not crash',()=>{
+  const st={t0:1000,players:{}};
+  C.resumeShift(st,500);
+  return eq(st.t0,1500);});
+
+/* ---- host succession ---- */
+const roomOf=(hostId,players,phase)=>({hostId:hostId,phase:phase||'HUNT_1',hostAt:0,players:players});
+t('the heir is the same on every phone, because they all read the same room',()=>{
+  const p={zeta:{online:9e9},alpha:{online:9e9},mid:{online:9e9},host:{online:9e9}};
+  const st=roomOf('host',p);
+  return eq(C.hostHeir(st,9e9),'alpha');});
+t('the phone that vanished is never elected to replace itself',()=>{
+  const st=roomOf('host',{host:{online:9e9},bravo:{online:9e9}});
+  return eq(C.hostHeir(st,9e9),'bravo');});
+t('a bot cannot host a match',()=>{
+  const st=roomOf('host',{host:{online:9e9},aaa:{bot:true,online:9e9},bbb:{online:9e9}});
+  return eq(C.hostHeir(st,9e9),'bbb');});
+t('a phone that has also gone quiet is skipped over',()=>{
+  const st=roomOf('host',{host:{online:0},aaa:{online:0},bbb:{online:200000}});
+  return eq(C.hostHeir(st,200000),'bbb');});
+t('a host still writing is never replaced',()=>{
+  const st=roomOf('host',{host:{online:9e9},aaa:{online:9e9}}); st.hostAt=200000;
+  return ok(!C.shouldClaimHost(st,'aaa',200000));});
+t('the heir takes over once the host stops writing',()=>{
+  const st=roomOf('host',{host:{online:0},aaa:{online:200000},bbb:{online:200000}});
+  return ok(C.shouldClaimHost(st,'aaa',200000));});
+t('only the heir takes over, so two phones cannot both claim it',()=>{
+  const st=roomOf('host',{host:{online:0},aaa:{online:200000},bbb:{online:200000}});
+  return ok(!C.shouldClaimHost(st,'bbb',200000));});
+t('nobody takes over a match that has already finished',()=>{
+  const st=roomOf('host',{host:{online:0},aaa:{online:200000}},'RESULTS');
+  return ok(!C.shouldClaimHost(st,'aaa',200000));});
+t('a lobby whose host walked off is rescued too',()=>{
+  const st=roomOf('host',{host:{online:0},aaa:{online:200000}},'LOBBY');
+  return ok(C.shouldClaimHost(st,'aaa',200000));});
+t('the last phone standing hosts rather than nobody',()=>{
+  const st=roomOf('host',{host:{online:0},solo:{online:200000}});
+  return ok(C.shouldClaimHost(st,'solo',200000));});
+t('a room with nobody left to promote elects no one',()=>{
+  const st=roomOf('host',{host:{online:0}});
+  return ok(C.hostHeir(st,200000)===null&&!C.shouldClaimHost(st,'host',200000));});
+
 /* ---- Supabase transport shaping ---- */
 const MP={url:'https://abc.supabase.co',key:'x'.repeat(40)};
 t('a call carries the key both ways round',()=>{

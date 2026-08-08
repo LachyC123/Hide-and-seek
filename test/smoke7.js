@@ -224,6 +224,32 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
       ()=>GUEST.text('#hNet')==='SYNCED',10000);
     log.push('guest room chip: '+GUEST.text('#hNet'));
 
+    // ---- pausing has to reach the other phone, and lift again ----
+    await waitFor('the host to finish its own role reveal',
+      ()=>HOST.screen()==='s-role'&&HOST.text('#roleTitle').length>0,10000);
+    HOST.click('#b-role-ok');
+    await waitFor('the host HUD',()=>HOST.screen()==='s-match');
+    await waitFor('host controls to appear for the host',
+      ()=>!HOST.D.querySelector('#hostbtn').classList.contains('hidden'),8000);
+    if(!GUEST.D.querySelector('#hostbtn').classList.contains('hidden'))
+      throw new Error('a guest was offered host controls');
+    HOST.click('#hostbtn');
+    [...HOST.D.querySelectorAll('.modal button')]
+      .find(b=>/Pause the match/.test(b.textContent)).click();
+    await waitFor('the pause to reach the guest',()=>{
+      pump(HOST,GUEST);
+      return !GUEST.D.querySelector('#paused').classList.contains('hidden');
+    },14000);
+    log.push('guest sees: "'+GUEST.text('#paused h1')+'" — '+GUEST.text('#pausedBy'));
+    if(!GUEST.D.querySelector('#b-resume').classList.contains('hidden'))
+      throw new Error('a guest was offered the resume button');
+    HOST.click('#b-resume');
+    await waitFor('play to restart on the guest',()=>{
+      pump(HOST,GUEST);
+      return GUEST.D.querySelector('#paused').classList.contains('hidden');
+    },14000);
+    log.push('resumed, and the guest came back out of the pause screen');
+
     // ---- an action taken on the guest has to land on the host ----
     HOST.dev('skip scatter');
     HOST.dev('to tribunal 1');
@@ -251,6 +277,7 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
     },14000);
     await waitFor('the reloaded guest to still be the same player',
       ()=>RETURN.text('#hRole')===revealed,10000);
+    const RETURN_ID=JSON.parse(await guestDisk.get('fs:profile').then(r=>r.value)).id;
     log.push('reload rejoined via the link, still '+RETURN.text('#hRole'));
     if(HOST.text('#devlog').indexOf('players 4')<0)
       throw new Error('rejoining created a duplicate player: '+
@@ -286,10 +313,31 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
     log.push('operations exercised: '+[...seenOps].sort().join(', '));
     log.push('legacy-schema project played a full match without being asked to re-run any SQL');
 
+    // ---- the host's phone dies: the match must not die with it ----
+    const hostWas=DB.rooms.get(code).hostId;
+    HOST.w.close();
+    // the room row simply stops being written; age it so the survivors notice now
+    // rather than after the twenty second timeout this test has no reason to sit through
+    DB.rooms.get(code).hostAt=Date.now()-120000;
+    await waitFor('a surviving phone to take the match over',()=>{
+      pump(RETURN);
+      return DB.rooms.get(code).hostId!==hostWas;
+    },20000);
+    const tookOver=DB.rooms.get(code).hostId;
+    if(tookOver!==RETURN_ID) throw new Error('an unexpected phone claimed the match: '+tookOver);
+    // the dev log refreshes on its own timer; give it a tick rather than racing it
+    await waitFor('the new host to know it is hosting',
+      ()=>RETURN.text('#devlog').indexOf('[host]')>=0,8000);
+    await waitFor('the rescued match to keep running',()=>{
+      pump(RETURN);
+      return DB.rooms.get(code).ver>0&&/net .*synced/.test(RETURN.text('#devlog'));
+    },14000);
+    log.push('host phone died; '+RETURN.text('#hRole')+' player took over and the match kept running');
+
     // ...and a project on the current schema must not be dragged down the fallback path.
     // Shut the legacy windows first: their sync loops keep polling and would otherwise
     // show up as fallback traffic from the new one.
-    HOST.w.close(); RETURN.w.close();
+    RETURN.w.close();
     await sleep(600);
     LEGACY_ONLY=false; seenFns.clear();
     const FRESH=makeWindow('fresh','#mp='+MP,makeStore());

@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  218 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  239 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -80,10 +80,15 @@ Break any of these and the game stops making sense:
   and a dropped player must never be able to make a seeker win impossible.
 - Vote quorum counts only players who are still answering. One dropped phone must not make
   every tribunal resolve as "no decision".
+- Nearly every deadline in a match is a wall-clock stamp, so pausing cannot just stop a counter:
+  `resumeShift` moves all of them, and anything added to the state that expires must be listed in
+  `DEADLINES` or `PLAYER_DEADLINES` or it fires the instant play restarts.
+- A paused match advances nothing at all — no clock, no zone, no bots, no catches.
 
 ## Current state
 
-Working: profile and 12 procedural characters, room-code lobby over Supabase with a shareable
+Working: host pause/resume and end-early, host migration, a wake lock that survives
+backgrounding, on-map guidance to the safe zone, profile and 12 procedural characters, room-code lobby over Supabase with a shareable
 join link, mid-match rejoin, dropped-phone handling, roles, scatter, real-street map with a
 walkable road graph driving objective and lure placement and bot movement, smooth character
 movement, seeker blips, catching and conversion, moving/shrinking zone with preview, imposter
@@ -132,8 +137,11 @@ Things that are load-bearing and easy to break:
 
 Known limits, in the order they'll hurt:
 
-1. **The host must stay open.** There is no host migration — if the host's phone dies, the match
-   dies with it. Clients detect it (`hostAlive`) and say so, but cannot take over.
+1. **Host migration is best-effort.** When `hostAt` goes stale every phone computes the same
+   heir from the same room record (`hostHeir`: lowest id among present non-bots) and only that
+   one claims, so a split brain needs two phones disagreeing about the record. The new host
+   seeds `lastSeq` from `st.ack` — without that it replays every action still in the other
+   phones' outboxes. A match whose last phone dies is still gone.
 2. **Anyone holding a room code can read that room, including who the imposter is.** The code is
    the only secret; rooms cannot be listed or enumerated, but a leaked code is a leaked match.
 3. Street data comes from public Overpass, now with four mirrors and failover. Fine for testing,
@@ -150,7 +158,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           218 core tests + 7 smoke runs
+npm test           239 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 
