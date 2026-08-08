@@ -1,5 +1,10 @@
 const fs=require('fs');const {JSDOM}=require('jsdom');const stubAll=require('./_stub');
-const html=fs.readFileSync(require('path').join(__dirname,'..','index.html'),'utf8');
+const built=fs.readFileSync(require('path').join(__dirname,'..','index.html'),'utf8');
+/* This run is about the build with no connection baked in — what anyone forking the
+   repo gets. The shipped index.html has a real project in MP_DEFAULT, so blank it out
+   rather than quietly testing the connected path and claiming to have tested this one. */
+const html=built.replace(/var MP_DEFAULT=\{[\s\S]*?\};/,"var MP_DEFAULT={url:'',key:''};");
+if(html===built) { console.log('smoke6: could not blank MP_DEFAULT — has it been renamed?'); process.exit(1); }
 const errors=[];const dom=new JSDOM(html,{runScripts:'dangerously',pretendToBeVisual:true,url:'https://example.com/',beforeParse:stubAll});
 const w=dom.window;w.addEventListener('error',e=>errors.push(e.message));
 const stub=new Proxy({},{get:(t,k)=>k==='measureText'?(()=>({width:20})):(()=>{})});
@@ -61,9 +66,46 @@ setTimeout(()=>{
         console.log('\nFALSE SAFE — real map & GPS');console.log('─'.repeat(38));
         out.forEach(o=>console.log('  · '+o));
         console.log(errors.length?('  ERRORS '+errors.join(';')):'  no runtime errors');
-        process.exit(errors.length?1:0);
+        if(errors.length) process.exit(1);   // the pre-connected run below finishes the job
       },400);
     },500);
   },700);
 },400);
 setTimeout(()=>{console.log('timeout');process.exit(1);},20000);
+
+/* The shipped build is the one people actually open. If MP_DEFAULT is filled in, the
+   home screen must reach a lobby without ever offering the setup screen — that is the
+   whole point of baking it in, and nothing else covers it. */
+setTimeout(()=>{
+  const d2=new JSDOM(built,{runScripts:'dangerously',pretendToBeVisual:true,
+    url:'https://example.com/',beforeParse(x){
+      stubAll(x);
+      x.HTMLCanvasElement.prototype.getContext=()=>stub;
+      x.navigator.geolocation={watchPosition:ok=>{
+        ok({coords:{latitude:-33.8688,longitude:151.2093,accuracy:7}});return 1;}};
+      x.fetch=()=>Promise.resolve({ok:true,status:200,
+        text:()=>Promise.resolve('null'),json:()=>Promise.resolve(null)});
+    }});
+  const w2=d2.window, q2=s=>w2.document.querySelector(s);
+  setTimeout(()=>{
+    const errs=[];
+    q2('#b-begin').click(); q2('#nameInput').value='LACHY'; q2('#b-name-next').click();
+    q2('#b-char-next').click(); q2('#b-safety-ok').click();
+    q2('#b-create').click(); q2('#b-create-go').click();
+    const shipped=q2('.screen.active').id;
+    if(shipped!=='s-lobby')
+      errs.push('shipped build did not reach a lobby (got '+shipped+') — is MP_DEFAULT valid?');
+    if(w2.document.querySelector('.modal'))
+      errs.push('shipped build asked for multiplayer setup despite a baked-in connection');
+    const link=q2('#lobbyLink').textContent;
+    if(link.indexOf('#room=')<0||link.indexOf('mp=')<0)
+      errs.push('shipped build produced no usable join link: '+link);
+    console.log('\nFALSE SAFE — the shipped build is pre-connected');
+    console.log('─'.repeat(38));
+    console.log('  · create game went straight to: '+shipped);
+    console.log('  · join link handed out: '+(link.length>40?'yes ('+link.length+' chars)':link));
+    if(errs.length){ console.log('\n  ERRORS:'); errs.forEach(e=>console.log('   ! '+e)); }
+    else console.log('\n  no runtime errors');
+    process.exit(errs.length?1:0);
+  },600);
+},2500);
