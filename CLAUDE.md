@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  200 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  204 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -100,9 +100,10 @@ adapters behind one four-call interface (`netPutState` / `netGetState` / `netPut
 
 - **`supabase`** — plain REST via `fetch`, no SDK. The browser never touches a table: RLS is on
   with no policies and the grants are revoked, so everything goes through `security definer`
-  functions that each take the room code. `rpcFor` is the single map from operation to function,
-  `MP_SQL` is the schema that must define and grant every one of them, and a harness test fails
-  if those two ever disagree. Config comes from the join link hash
+  routine `fs_rpc`, which always takes the room code. `rpcFor` is the single map from operation
+  name to argument set and `MP_SQL` is the schema; harness tests fail if the client can send an
+  operation the SQL has no branch for, and if MP_SQL grows past 50 lines — people paste it by
+  hand on a phone. Config comes from the join link hash
   (`#room=CODE&mp=<url>~<anonkey>`), then the saved profile, then `MP_DEFAULT` baked into the
   build. This is the only adapter that works phone to phone from a static host.
 - **`storage`** — the old `window.storage` bridge. Only works inside a host page that injects it.
@@ -143,7 +144,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           200 core tests + 7 smoke runs
+npm test           204 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

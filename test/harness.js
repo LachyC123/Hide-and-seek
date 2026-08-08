@@ -679,37 +679,46 @@ t('a Prefer header is passed through when it is wanted',()=>
 t('a trailing slash on the project URL does not double up',()=>
   eq(C.supaRequest({url:'https://abc.supabase.co/',key:MP.key},'rpc/fs_get_room').url,
      'https://abc.supabase.co/rest/v1/rpc/fs_get_room'));
+const ALL_OPS=['putState','getState','dropRoom','putInput','listInputs','clearInputs','dropInput'];
 t('every room operation names the room it is for',()=>{
-  ['putState','getState','dropRoom','putInput','listInputs','clearInputs','dropInput']
-    .forEach(op=>{
-      const c=C.rpcFor(op,'ABCDE','p1',{x:1});
-      if(!c) throw new Error(op+' has no stored function');
-      if(c.args.p_code!=='ABCDE') throw new Error(op+' does not pass the room code');
-    });
+  ALL_OPS.forEach(op=>{
+    const c=C.rpcFor(op,'ABCDE','p1',{x:1});
+    if(!c) throw new Error(op+' has no stored routine');
+    if(c.args.room!=='ABCDE') throw new Error(op+' does not pass the room code');
+  });
   return true;});
+t('an operation the client does not have is refused, not guessed at',()=>
+  eq(C.rpcFor('deleteEverything','ABCDE'),null));
 t('reading a room is impossible without naming it',()=>{
   const c=C.rpcFor('getState','ABCDE');
-  return ok(c.fn==='fs_get_room'&&Object.keys(c.args).length===1&&c.args.p_code==='ABCDE');});
+  return ok(c.fn==='fs_rpc'&&c.args.op==='get_room'&&
+            Object.keys(c.args).length===2&&c.args.room==='ABCDE');});
 t('a player-scoped call names the player too',()=>{
   const c=C.rpcFor('putInput','ABCDE','p1',{lat:1});
-  return ok(c.args.p_player==='p1'&&c.args.p_input.lat===1);});
-t('every stored function the client calls exists in the SQL it ships',()=>{
-  // the SQL block is the install instructions; a call with no matching function is a
-  // support ticket that reads "HTTP 404" and nothing else
-  const fns=['putState','getState','dropRoom','putInput','listInputs','clearInputs','dropInput']
-    .map(op=>C.rpcFor(op).fn);
-  const missing=fns.filter(f=>C.MP_SQL.indexOf('function '+f+'(')<0);
-  if(missing.length) throw new Error('not created by MP_SQL: '+missing.join(', '));
-  const ungranted=fns.filter(f=>C.MP_SQL.slice(C.MP_SQL.indexOf('grant execute')).indexOf(f+'(')<0);
-  if(ungranted.length) throw new Error('never granted to anon: '+ungranted.join(', '));
+  return ok(c.args.pid==='p1'&&c.args.body.lat===1);});
+t('no two operations collide on the same name',()=>{
+  const names=ALL_OPS.map(op=>C.rpcFor(op,'A').args.op);
+  return eq(new Set(names).size,names.length);});
+t('every operation the client sends has a branch in the SQL it ships',()=>{
+  // the SQL block is the install instructions; an operation with no matching branch
+  // fails silently as a no-op, which is worse than an error
+  const missing=ALL_OPS
+    .map(op=>C.rpcFor(op,'A').args.op)
+    .filter(name=>C.MP_SQL.indexOf("op = '"+name+"'")<0);
+  if(missing.length) throw new Error('MP_SQL handles no such operation: '+missing.join(', '));
   return true;});
+t('the routine the client calls is the one the SQL creates and grants',()=>{
+  const fn=C.rpcFor('getState','A').fn;
+  return ok(C.MP_SQL.indexOf('function '+fn+'(')>=0&&
+            C.MP_SQL.slice(C.MP_SQL.indexOf('grant execute')).indexOf(fn+'(')>=0);});
 t('the SQL leaves the tables unreachable from a browser',()=>
-  ok(C.MP_SQL.indexOf('revoke all on fs_rooms')>=0&&
-     C.MP_SQL.indexOf('revoke all on fs_inputs')>=0&&
+  ok(C.MP_SQL.indexOf('revoke all on fs_rooms, fs_inputs')>=0&&
      C.MP_SQL.indexOf('enable row level security')>=0));
-t('the SQL clears the older open policies so it can be re-run',()=>
-  ok(C.MP_SQL.indexOf('drop policy if exists fs_rooms_all')>=0&&
-     C.MP_SQL.indexOf('drop policy if exists fs_inputs_all')>=0));
+t('the SQL clears out the earlier multi-routine version',()=>
+  ok(C.MP_SQL.indexOf('drop function if exists fs_put_room')>=0));
+t('the SQL stays short enough to paste on a phone',()=>{
+  const lines=C.MP_SQL.split('\n').length;
+  return ok(lines<=50,'grown to '+lines+' lines');});
 t('a missing function is explained as unrun SQL, not as a 404',()=>
   ok(/SQL/.test(C.supaErrorText(404,''))&&/SQL/.test(C.supaErrorText(400,'{"code":"PGRST202"}'))));
 t('a rejected key points at the service_role mix-up',()=>

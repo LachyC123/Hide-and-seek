@@ -365,90 +365,61 @@ function supaRequest(mp,path,opts){
 /* Every room operation is a stored function that takes the room code, and the
    tables themselves are unreachable from the browser. Knowing a code is the only
    way in: no listing rooms, no reading a match you were not invited to. */
+var RPC_OPS={putState:'put_room',getState:'get_room',dropRoom:'drop_room',
+  putInput:'put_input',listInputs:'list_inputs',clearInputs:'clear_inputs',dropInput:'drop_input'};
 function rpcFor(op,code,id,payload){
-  if(op==='putState')    return {fn:'fs_put_room',   args:{p_code:code,p_state:payload}};
-  if(op==='getState')    return {fn:'fs_get_room',   args:{p_code:code}};
-  if(op==='dropRoom')    return {fn:'fs_drop_room',  args:{p_code:code}};
-  if(op==='putInput')    return {fn:'fs_put_input',  args:{p_code:code,p_player:id,p_input:payload}};
-  if(op==='listInputs')  return {fn:'fs_list_inputs',args:{p_code:code}};
-  if(op==='clearInputs') return {fn:'fs_clear_inputs',args:{p_code:code}};
-  if(op==='dropInput')   return {fn:'fs_drop_input', args:{p_code:code,p_player:id}};
-  return null;
+  var o=RPC_OPS[op]; if(!o) return null;
+  var args={op:o,room:code};
+  if(id!==undefined&&id!==null) args.pid=id;
+  if(payload!==undefined&&payload!==null) args.body=payload;
+  return {fn:'fs_rpc',args:args};
 }
 var MP_SQL=[
-  '-- FALSE SAFE room storage. Run once in the Supabase SQL editor.',
-  '-- Safe to re-run, and safe to run over the older table-policy version.',
+  '-- FALSE SAFE room storage. Paste all of this into the Supabase SQL editor and Run.',
+  '-- Safe to run more than once.',
   '',
   'create table if not exists fs_rooms (',
-  '  code text primary key,',
-  '  state jsonb not null,',
+  '  code text primary key, state jsonb not null,',
   '  updated_at timestamptz not null default now());',
   '',
   'create table if not exists fs_inputs (',
-  '  code text not null,',
-  '  player_id text not null,',
-  '  input jsonb not null,',
+  '  code text not null, player_id text not null, input jsonb not null,',
   '  updated_at timestamptz not null default now(),',
   '  primary key (code, player_id));',
   '',
-  'create index if not exists fs_rooms_updated  on fs_rooms(updated_at);',
-  'create index if not exists fs_inputs_updated on fs_inputs(updated_at);',
-  '',
-  '-- The tables are not reachable from a browser at all. Everything goes through the',
-  '-- functions below, and every one of them demands the room code. Nobody can list',
-  '-- rooms or read a match they were not invited to.',
-  'drop policy if exists fs_rooms_all  on fs_rooms;',
-  'drop policy if exists fs_inputs_all on fs_inputs;',
+  '-- A browser can never touch these tables. The one routine below is the only way in,',
+  '-- and it always needs the room code -- so nobody can list rooms or read a match',
+  '-- they were not invited to.',
   'alter table fs_rooms  enable row level security;',
   'alter table fs_inputs enable row level security;',
-  'revoke all on fs_rooms  from anon, authenticated;',
-  'revoke all on fs_inputs from anon, authenticated;',
+  'revoke all on fs_rooms, fs_inputs from anon, authenticated;',
+  'drop function if exists fs_put_room(text,jsonb), fs_get_room(text), fs_drop_room(text),',
+  '  fs_put_input(text,text,jsonb), fs_list_inputs(text), fs_clear_inputs(text),',
+  '  fs_drop_input(text,text);',
   '',
-  'create or replace function fs_put_room(p_code text, p_state jsonb) returns void',
-  'language sql security definer set search_path = public as $$',
-  '  insert into fs_rooms(code, state, updated_at) values (upper(p_code), p_state, now())',
-  '  on conflict (code) do update set state = excluded.state, updated_at = now();',
-  '$$;',
+  'create or replace function fs_rpc(op text, room text, pid text default $q$$q$, body jsonb default null)',
+  'returns jsonb language plpgsql security definer set search_path = public as $$',
+  'declare c text := upper(room);',
+  'begin',
+  "  if    op = 'put_room'     then insert into fs_rooms(code, state, updated_at)",
+  '                                 values (c, body, now()) on conflict (code)',
+  '                                 do update set state = body, updated_at = now();',
+  "  elsif op = 'get_room'     then return (select state from fs_rooms where code = c);",
+  "  elsif op = 'drop_room'    then delete from fs_inputs where code = c;",
+  '                                delete from fs_rooms  where code = c;',
+  "  elsif op = 'put_input'    then insert into fs_inputs(code, player_id, input, updated_at)",
+  '                                 values (c, pid, body, now()) on conflict (code, player_id)',
+  '                                 do update set input = body, updated_at = now();',
+  "  elsif op = 'list_inputs'  then return (select coalesce(jsonb_agg(input), '[]'::jsonb)",
+  '                                        from fs_inputs where code = c);',
+  "  elsif op = 'clear_inputs' then delete from fs_inputs where code = c;",
+  "  elsif op = 'drop_input'   then delete from fs_inputs where code = c and player_id = pid;",
+  '  end if;',
+  '  return null;',
+  'end $$;',
   '',
-  'create or replace function fs_get_room(p_code text) returns jsonb',
-  'language sql security definer set search_path = public as $$',
-  '  select state from fs_rooms where code = upper(p_code);',
-  '$$;',
-  '',
-  'create or replace function fs_drop_room(p_code text) returns void',
-  'language sql security definer set search_path = public as $$',
-  '  delete from fs_inputs where code = upper(p_code);',
-  '  delete from fs_rooms  where code = upper(p_code);',
-  '$$;',
-  '',
-  'create or replace function fs_put_input(p_code text, p_player text, p_input jsonb) returns void',
-  'language sql security definer set search_path = public as $$',
-  '  insert into fs_inputs(code, player_id, input, updated_at)',
-  '  values (upper(p_code), p_player, p_input, now())',
-  '  on conflict (code, player_id) do update set input = excluded.input, updated_at = now();',
-  '$$;',
-  '',
-  'create or replace function fs_list_inputs(p_code text) returns jsonb',
-  'language sql security definer set search_path = public as $$',
-  "  select coalesce(jsonb_agg(input), '[]'::jsonb) from fs_inputs where code = upper(p_code);",
-  '$$;',
-  '',
-  'create or replace function fs_clear_inputs(p_code text) returns void',
-  'language sql security definer set search_path = public as $$',
-  '  delete from fs_inputs where code = upper(p_code);',
-  '$$;',
-  '',
-  'create or replace function fs_drop_input(p_code text, p_player text) returns void',
-  'language sql security definer set search_path = public as $$',
-  '  delete from fs_inputs where code = upper(p_code) and player_id = p_player;',
-  '$$;',
-  '',
-  'grant execute on function',
-  '  fs_put_room(text, jsonb), fs_get_room(text), fs_drop_room(text),',
-  '  fs_put_input(text, text, jsonb), fs_list_inputs(text),',
-  '  fs_clear_inputs(text), fs_drop_input(text, text)',
-  'to anon;'
-].join('\n');
+  'grant execute on function fs_rpc(text, text, text, jsonb) to anon;'
+].join('\n').replace(/\$q\$/g,"'");
 
 /* PostgREST reports a missing function as PGRST202. That is not a network problem,
    it means the SQL was never run — say so instead of "HTTP 404". */

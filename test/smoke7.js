@@ -25,17 +25,28 @@ function res(status,body){
    not one of them 404s, exactly like PostgREST would if the SQL had not been run —
    and there is deliberately no way to read a room without naming its code. */
 const clone=v=>JSON.parse(JSON.stringify(v));
+const seenOps=new Set();
 const FUNCTIONS={
-  fs_put_room:a=>{ DB.rooms.set(a.p_code.toUpperCase(),clone(a.p_state)); return null; },
-  fs_get_room:a=>DB.rooms.get(a.p_code.toUpperCase())||null,
-  fs_drop_room:a=>{ const c=a.p_code.toUpperCase(); DB.rooms.delete(c);
-    [...DB.inputs.keys()].forEach(k=>{ if(k.split('|')[0]===c) DB.inputs.delete(k); }); return null; },
-  fs_put_input:a=>{ DB.inputs.set(a.p_code.toUpperCase()+'|'+a.p_player,clone(a.p_input)); return null; },
-  fs_list_inputs:a=>{ const c=a.p_code.toUpperCase(), out=[];
-    DB.inputs.forEach((v,k)=>{ if(k.split('|')[0]===c) out.push(clone(v)); }); return out; },
-  fs_clear_inputs:a=>{ const c=a.p_code.toUpperCase();
-    [...DB.inputs.keys()].forEach(k=>{ if(k.split('|')[0]===c) DB.inputs.delete(k); }); return null; },
-  fs_drop_input:a=>{ DB.inputs.delete(a.p_code.toUpperCase()+'|'+a.p_player); return null; }
+  fs_rpc:a=>{
+    const c=String(a.room||'').toUpperCase();
+    if(!c) throw new Error('fs_rpc called without a room code');
+    seenOps.add(a.op);
+    const wipeInputs=()=>[...DB.inputs.keys()]
+      .forEach(k=>{ if(k.split('|')[0]===c) DB.inputs.delete(k); });
+    switch(a.op){
+      case 'put_room':     DB.rooms.set(c,clone(a.body)); return null;
+      case 'get_room':     return DB.rooms.get(c)||null;
+      case 'drop_room':    wipeInputs(); DB.rooms.delete(c); return null;
+      case 'put_input':    DB.inputs.set(c+'|'+a.pid,clone(a.body)); return null;
+      case 'list_inputs':  { const out=[];
+        DB.inputs.forEach((v,k)=>{ if(k.split('|')[0]===c) out.push(clone(v)); }); return out; }
+      case 'clear_inputs': wipeInputs(); return null;
+      case 'drop_input':   DB.inputs.delete(c+'|'+a.pid); return null;
+      // Postgres would fall through the if/elsif and quietly return null, so the fake
+      // must too — and the run fails below if the client ever sends an unknown op.
+      default: return null;
+    }
+  }
 };
 let tableHits=0;
 function backend(url,opts){
@@ -243,8 +254,12 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
       (/uncaught (\d+)/.exec(HOST.text('#devlog'))||[])[1]);
 
     if(badAuth) throw new Error(badAuth+' requests went out without valid credentials');
-    if(tableHits) throw new Error(tableHits+' requests bypassed the stored functions and hit a table directly');
-    log.push('backend calls: '+calls+', all authenticated, all via stored functions');
+    if(tableHits) throw new Error(tableHits+' requests bypassed the stored routine and hit a table directly');
+    const KNOWN=['put_room','get_room','drop_room','put_input','list_inputs','clear_inputs','drop_input'];
+    const unknown=[...seenOps].filter(o=>KNOWN.indexOf(o)<0);
+    if(unknown.length) throw new Error('client sent operations the SQL does not handle: '+unknown.join(', '));
+    log.push('backend calls: '+calls+', all authenticated, all via fs_rpc');
+    log.push('operations exercised: '+[...seenOps].sort().join(', '));
 
     // bandwidth is the thing that decides whether a free project survives a match
     const wire=DB.rooms.get(code);
