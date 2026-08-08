@@ -1,0 +1,2794 @@
+/* FALSE SAFE — single-file build. Author: built for Lachy / Hamlet Ventures. */
+(function(){
+'use strict';
+
+/* ============================================================
+   CORE_START — pure logic, no DOM. Mirrored by test harness.
+   ============================================================ */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+var EARTH=6378137;
+function metersBetween(a,b){
+  var dLat=(b.lat-a.lat)*Math.PI/180, dLng=(b.lng-a.lng)*Math.PI/180;
+  var la=(a.lat+b.lat)/2*Math.PI/180;
+  var x=dLng*Math.cos(la), y=dLat;
+  return Math.sqrt(x*x+y*y)*EARTH;
+}
+function offsetLatLng(p,dx,dy){ // dx east metres, dy north metres
+  return {lat:p.lat+(dy/EARTH)*180/Math.PI, lng:p.lng+(dx/(EARTH*Math.cos(p.lat*Math.PI/180)))*180/Math.PI};
+}
+
+var CFG={
+  scatter:180, voteLen:60, catchRadius:10, conversion:60, locFresh:25,
+  fullSignal:{1:60,2:90}, zoneStages:5, zoneShrink:0.66, zoneMinR:45,
+  zonePreview:150, zoneClose:45, graceOutside:45, tribunals:2,
+  missionFollowRadius:25, missionFollowTime:30, objectiveRadius:20, objectiveTime:15,
+  trackScale:1, objectives:1, mapStyle:'real',
+  // GPS handling
+  gpsForgive:1, catchSlop:0.5, catchSlopMax:15, maxAcc:65, maxSpeed:12, gpsQ:1.6,
+  // multiplayer presence: a phone that stops reporting is stale, then lost
+  dropStale:45, dropLost:150, hostTimeout:20, syncHost:1200, syncClient:1500,
+  // roads: how far a spawn point may be dragged to land on something walkable
+  snapRadius:45, roadCell:60
+};
+var DEFAULTS=JSON.parse(JSON.stringify(CFG));
+function applyCfg(c){
+  if(!c) return CFG;
+  ['scatter','catchRadius','conversion','zoneStages','tribunals','trackScale','objectives',
+   'gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
+  if(c.zoneShrink!==undefined) CFG.zoneShrink=clampN(c.zoneShrink,0.4,0.95);
+  if(c.fullSignal!==undefined){ CFG.fullSignal={1:c.fullSignal,2:c.fullSignal+30}; }
+  return CFG;
+}
+function clampN(v,a,b){return v<a?a:v>b?b:v;}
+function sanitiseCfg(c){
+  var d={matchLen:1800,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
+    fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,objectives:1,
+    gpsForgive:1,mapStyle:'real'};
+  c=c||{};
+  var o={
+    matchLen:clampN(+c.matchLen||d.matchLen,600,5400),
+    areaR:clampN(+c.areaR||d.areaR,100,1500),
+    imposters:(c.imposters===undefined?d.imposters:(c.imposters?1:0)),
+    scatter:clampN(+c.scatter||d.scatter,30,600),
+    catchRadius:clampN(+c.catchRadius||d.catchRadius,5,30),
+    conversion:clampN(+c.conversion||d.conversion,10,180),
+    fullSignal:clampN(+c.fullSignal||d.fullSignal,20,180),
+    zoneStages:clampN(c.zoneStages===undefined?d.zoneStages:+c.zoneStages,0,8),
+    zoneShrink:clampN(+c.zoneShrink||d.zoneShrink,0.4,0.95),
+    tribunals:clampN(c.tribunals===undefined?d.tribunals:+c.tribunals,0,2),
+    trackScale:clampN(+c.trackScale||d.trackScale,0.4,2.5),
+    objectives:(c.objectives===undefined?d.objectives:(c.objectives?1:0)),
+    gpsForgive:(c.gpsForgive===undefined?d.gpsForgive:(c.gpsForgive?1:0)),
+    mapStyle:(c.mapStyle==='pixel'?'pixel':'real')
+  };
+  if(o.scatter>o.matchLen*0.4) o.scatter=Math.round(o.matchLen*0.4);
+  return o;
+}
+
+/* --- match schedule ------------------------------------------------ */
+function schedule(cfg){
+  var M=cfg.matchLen, V=CFG.voteLen, T=CFG.tribunals, marks=[];
+  for(var i=0;i<T;i++) marks.push(M*(i+1)/(T+1)+i*V);
+  return {marks:marks, V:V, end:M+T*V, t1:marks[0], t1End:marks[0]!==undefined?marks[0]+V:undefined,
+          t2:marks[1], t2End:marks[1]!==undefined?marks[1]+V:undefined};
+}
+function phaseFor(t,cfg){ // t = seconds since match start (scatter included)
+  if(t<CFG.scatter) return 'SCATTER';
+  var m=t-CFG.scatter, s=schedule(cfg);
+  if(!s.marks.length) return m>=s.end?'RESULTS':(m<s.end*0.66?'HUNT_1':'HUNT_ENDGAME');
+  for(var i=0;i<s.marks.length;i++){
+    if(m<s.marks[i]) return 'HUNT_'+(i+1);
+    if(m<s.marks[i]+s.V) return (i===s.marks.length-1)?'FINAL_TRIBUNAL':'TRIBUNAL_'+(i+1);
+  }
+  if(m<s.end) return 'HUNT_ENDGAME';
+  return 'RESULTS';
+}
+function huntClock(t){return Math.max(0,t-CFG.scatter);}
+
+/* --- roles ---------------------------------------------------------- */
+function assignRoles(ids,rng,imposters){
+  var pool=ids.slice(), out={}, i;
+  for(i=pool.length-1;i>0;i--){var j=Math.floor(rng()*(i+1));var tmp=pool[i];pool[i]=pool[j];pool[j]=tmp;}
+  for(i=0;i<pool.length;i++) out[pool[i]]='hider';
+  out[pool[0]]='seeker';
+  var imp=null;
+  if(imposters>0&&pool.length>2){ imp=pool[1]; out[imp]='imposter'; }
+  return {roles:out,imposterId:imp,seekerId:pool[0]};
+}
+
+/* --- zone ------------------------------------------------------------ */
+function nextZone(rng,cur){
+  var r=Math.max(CFG.zoneMinR,cur.r*CFG.zoneShrink);
+  var maxOff=Math.max(0,cur.r-r);
+  var d=Math.sqrt(rng())*maxOff;           // uniform over the disc, not centre-biased
+  var a=rng()*Math.PI*2;
+  var c=offsetLatLng({lat:cur.lat,lng:cur.lng},Math.cos(a)*d,Math.sin(a)*d);
+  return {lat:c.lat,lng:c.lng,r:r};
+}
+function zoneContains(outer,inner){
+  return metersBetween(outer,inner)+inner.r<=outer.r+0.5;
+}
+function zoneStageTimes(cfg){
+  var s=schedule(cfg),out=[];
+  for(var i=0;i<CFG.zoneStages;i++) out.push(s.end*(i+1)/(CFG.zoneStages+1));
+  return out;
+}
+
+/* --- tracking accuracy ------------------------------------------------ */
+function trackingBand(progress){
+  if(progress<0.33) return {min:150,max:200,every:45};
+  if(progress<0.66) return {min:80,max:120,every:35};
+  return {min:40,max:70,every:25};
+}
+function makeBlip(rng,pos,progress,jammed){
+  var b=trackingBand(progress);
+  var unc=(b.min+rng()*(b.max-b.min))*(CFG.trackScale||1);
+  if(jammed) unc*=2.2;
+  var d=Math.sqrt(rng())*unc, a=rng()*Math.PI*2;
+  var c=offsetLatLng(pos,Math.cos(a)*d,Math.sin(a)*d);
+  return {lat:c.lat,lng:c.lng,r:unc};
+}
+
+/* --- catching --------------------------------------------------------- */
+function catchDistance(seeker,target,radius){
+  radius=radius||CFG.catchRadius;
+  if(!CFG.gpsForgive) return radius;
+  var a=Math.max(seeker&&seeker.acc||0,target&&target.acc||0);
+  return radius+Math.min(CFG.catchSlopMax,Math.max(0,a-8)*CFG.catchSlop);
+}
+function canCatch(seeker,target,nowMs,radius){
+  radius=catchDistance(seeker,target,radius);
+  if(!seeker||!target) return false;
+  if(seeker.id===target.id) return false;
+  if(seeker.role!=='seeker') return false;
+  if(seeker.converting) return false;
+  if(target.role==='seeker'||target.caught) return false;
+  if(!seeker.locT||!target.locT) return false;
+  if(nowMs-seeker.locT>CFG.locFresh*1000) return false;
+  if(nowMs-target.locT>CFG.locFresh*1000) return false;
+  return metersBetween(seeker,target)<=radius;
+}
+
+/* --- voting ----------------------------------------------------------- */
+function eligibleVoters(players){
+  return Object.keys(players).filter(function(id){var p=players[id];return !p.caught&&p.role!=='seeker';});
+}
+function resolveVote(votes,voterIds){
+  var tally={},top=null,topN=0,tie=false;
+  voterIds.forEach(function(id){
+    var v=votes[id]||'skip';
+    tally[v]=(tally[v]||0)+1;
+  });
+  Object.keys(tally).forEach(function(k){
+    if(tally[k]>topN){topN=tally[k];top=k;tie=false;}
+    else if(tally[k]===topN){tie=true;}
+  });
+  var need=Math.floor(voterIds.length/2)+1;
+  if(top===null||tie||topN<need||top==='skip') return {outcome:'skip',target:null,tally:tally};
+  return {outcome:'accuse',target:top,tally:tally};
+}
+function voteConsequence(res,imposterId,imposterEligible){
+  if(res.outcome==='skip') return {kind:'skip'};
+  if(imposterEligible&&res.target===imposterId) return {kind:'correct',target:res.target};
+  return {kind:'wrong',target:res.target};
+}
+
+/* --- win conditions ---------------------------------------------------- */
+function factionCounts(st){
+  var uncaught=[],genuine=[],impUncaught=false;
+  Object.keys(st.players).forEach(function(id){
+    var p=st.players[id];
+    if(p.role==='seeker'||p.caught) return;
+    uncaught.push(id);
+    var isActiveImp=(id===st.imposterId&&st.imposterEligible);
+    if(isActiveImp) impUncaught=true; else genuine.push(id);
+  });
+  return {uncaught:uncaught,genuine:genuine,impUncaught:impUncaught};
+}
+function checkWin(st,t){
+  var c=factionCounts(st);
+  if(c.impUncaught&&c.genuine.length===0) return {winner:'imposter',id:st.imposterId};
+  if(c.uncaught.length===0) return {winner:'seekers'};
+  if(t!==undefined&&t-CFG.scatter>=schedule(st.cfg).end){
+    if(c.genuine.length>0) return {winner:'hiders',ids:c.genuine};
+    return {winner:'seekers'};
+  }
+  return null;
+}
+
+/* --- outside-zone exposure --------------------------------------------- */
+function outsideState(p,zone,nowMs){
+  var d=metersBetween(p,zone);
+  if(d<=zone.r+15) return {outside:false,level:0};
+  if(!p.outsideSince) return {outside:true,level:0};
+  var secs=(nowMs-p.outsideSince)/1000;
+  if(secs<CFG.graceOutside) return {outside:true,level:0,grace:CFG.graceOutside-secs};
+  return {outside:true,level:secs<CFG.graceOutside+60?1:2};
+}
+
+/* --- imposter missions --------------------------------------------------- */
+/* `roads` is optional: {centre,graph}. With it, a lure spot lands on a street the
+   imposter can actually stand on instead of the middle of a lake or a locked yard. */
+function pickMission(rng,st,roads){
+  var c=factionCounts(st);
+  var targets=c.genuine.filter(function(id){return id!==st.imposterId;});
+  if(targets.length&&rng()<0.7){
+    return {type:'FOLLOW',targetId:targets[Math.floor(rng()*targets.length)],need:CFG.missionFollowTime,progress:0};
+  }
+  var p=reachableSpot(rng,st.zone,st.zone.r*0.8,roads);
+  return {type:'LURE',lat:p.lat,lng:p.lng,need:CFG.objectiveTime,progress:0};
+}
+/* One place decides where anything a player has to physically reach may spawn. */
+function reachableSpot(rng,centre,radius,roads){
+  if(roads&&roads.graph&&roads.centre){
+    var o=localFrom(roads.centre,centre);
+    var r=roadPointNear(roads.graph,rng,o.x,o.y,radius);
+    if(r) return offsetLatLng(roads.centre,r.x,r.y);
+  }
+  var d=Math.sqrt(rng())*radius, a=rng()*Math.PI*2;
+  return offsetLatLng(centre,Math.cos(a)*d,Math.sin(a)*d);
+}
+function missionTick(m,imp,players,dt){
+  if(!m||!imp) return {active:false,done:false};
+  var near=false;
+  if(m.type==='FOLLOW'){
+    var t=players[m.targetId];
+    near=!!(t&&!t.caught&&t.role!=='seeker'&&metersBetween(imp,t)<=CFG.missionFollowRadius);
+  } else {
+    near=metersBetween(imp,m)<=CFG.objectiveRadius;
+  }
+  if(near) m.progress=Math.min(m.need,m.progress+dt); else m.progress=Math.max(0,m.progress-dt*0.5);
+  return {active:near,done:m.progress>=m.need};
+}
+
+function makeGpsFilter(){
+  return {
+    pos:null, v:0, t:0, rejected:0, accepted:0,
+    push:function(fix){
+      // fix: {lat,lng,acc,t}
+      if(!fix||fix.lat==null) return null;
+      var acc=Math.max(1,fix.acc||30);
+      if(!this.pos){ this.pos={lat:fix.lat,lng:fix.lng,acc:acc,t:fix.t}; this.v=acc*acc; this.accepted++; return this.pos; }
+      if(fix.t-this.pos.t>15000){ // came back from a dropout — start clean
+        this.pos={lat:fix.lat,lng:fix.lng,acc:acc,t:fix.t}; this.v=acc*acc; this.t=fix.t; this.accepted++;
+        return this.pos;
+      }
+      var dt=Math.max(0.1,(fix.t-this.t||fix.t-this.pos.t)/1000);
+      var d=metersBetween(this.pos,fix);
+      // reject a wildly inaccurate fix unless we've had nothing for a while
+      if(acc>CFG.maxAcc&&d<400&&(fix.t-this.pos.t)<15000){ this.rejected++; return this.pos; }
+      // reject teleports faster than a person can run
+      if(d/dt>CFG.maxSpeed&&d>acc*2&&(fix.t-this.pos.t)<15000){ this.rejected++; return this.pos; }
+      this.v+=dt*CFG.gpsQ*CFG.gpsQ;
+      var k=this.v/(this.v+acc*acc);
+      var b=dirTo2(this.pos,fix);
+      var np=offsetLatLng(this.pos,b.x*d*k,b.y*d*k);
+      this.v=(1-k)*this.v;
+      this.pos={lat:np.lat,lng:np.lng,acc:Math.max(3,acc*Math.sqrt(1-k)+3),t:fix.t};
+      this.t=fix.t; this.accepted++;
+      return this.pos;
+    }
+  };
+}
+function dirTo2(a,b){
+  var e=metersBetween({lat:a.lat,lng:a.lng},{lat:a.lat,lng:b.lng})*(b.lng>a.lng?1:-1);
+  var n=metersBetween({lat:a.lat,lng:a.lng},{lat:b.lat,lng:a.lng})*(b.lat>a.lat?1:-1);
+  var l=Math.sqrt(e*e+n*n)||1; return {x:e/l,y:n/l};
+}
+function gpsQuality(acc){
+  if(acc==null) return {label:'SEARCHING',level:0};
+  if(acc<=12) return {label:'STRONG',level:3};
+  if(acc<=30) return {label:'OK',level:2};
+  if(acc<=CFG.maxAcc) return {label:'WEAK',level:1};
+  return {label:'POOR',level:0};
+}
+/* --- multiplayer plumbing -----------------------------------------------
+   The host is authoritative. Clients write one input row each and read the
+   room state back. Everything below is the part of that exchange that can be
+   reasoned about without a network, so it can be tested without one. */
+function newActions(actions,lastSeq){
+  var out=[];
+  (actions||[]).forEach(function(a){ if(a&&a.seq>(lastSeq||0)) out.push(a); });
+  out.sort(function(a,b){return a.seq-b.seq;});
+  return out;
+}
+/* Host-side merge of one client's input row. Only ever moves a player forward in
+   time — a stale row arriving late must not teleport somebody back. */
+function mergePlayerInput(p,inp,nowMs){
+  if(!p||!inp) return 0;
+  if(inp.name) p.name=inp.name;
+  if(inp.char!==undefined&&inp.char!==null) p.char=inp.char;
+  // Presence is "the row changed", not "the row exists". A dead phone leaves its
+  // last input behind forever; reading that row again is not a sign of life.
+  // The stamp is the host's clock, so two phones disagreeing about the time
+  // cannot make one of them look immortal or instantly lost.
+  if((inp.ts||0)>(p.inputTs||0)){ p.inputTs=inp.ts||0; p.online=nowMs; }
+  var moved=0;
+  if(inp.lat!=null&&(inp.locT||0)>(p.locSrc||0)){
+    if(p.lat!=null) moved=metersBetween(p,inp);
+    // How old the fix was when it was sent, measured entirely on the sender's own
+    // clock, then re-based onto ours. Catch validation turns on this being right:
+    // comparing a phone's timestamp against the host's clock means two phones that
+    // disagree about the time refuse every legitimate tag.
+    var age=Math.max(0,(inp.ts||inp.locT||0)-(inp.locT||0));
+    p.lat=inp.lat; p.lng=inp.lng; p.acc=inp.acc;
+    p.locSrc=inp.locT;                 // sender's clock, only ever compared to itself
+    p.locT=nowMs-age;                  // our clock, which is what freshness is checked against
+    if(p.stats) p.stats.dist+=moved;
+  }
+  return moved;
+}
+/* Clients keep resending until the host acknowledges. Without this an action
+   replays forever, and a host restart would re-apply every stale catch. */
+function pendingActions(outbox,ackSeq){
+  return (outbox||[]).filter(function(a){return a&&a.seq>(ackSeq||0);});
+}
+function presence(p,nowMs){
+  if(!p) return 'lost';
+  // bots, and anyone who has never had a sync stamp at all (the host's own row),
+  // are always present. `online: 0` is a real timestamp, not a missing one.
+  if(p.bot||p.online==null) return 'live';
+  var age=(nowMs-p.online)/1000;
+  if(age<CFG.dropStale) return 'live';
+  if(age<CFG.dropLost) return 'stale';
+  return 'lost';
+}
+/* Quorum has to be measured against the phones that are actually answering, or a
+   single dropped player makes every tribunal unwinnable. */
+function presentVoters(players,nowMs){
+  return eligibleVoters(players).filter(function(id){return presence(players[id],nowMs)!=='lost';});
+}
+/* A hider whose phone died must not be able to stall the match forever. */
+function lostHiders(players,nowMs){
+  return Object.keys(players).filter(function(id){
+    var p=players[id];
+    return p&&!p.caught&&p.role!=='seeker'&&presence(p,nowMs)==='lost';
+  });
+}
+function hostAlive(st,nowMs){ return !!st&&(nowMs-(st.hostAt||0))<CFG.hostTimeout*1000; }
+
+/* --- Supabase transport (plain REST, no SDK) --------------------------- */
+function supaRequest(mp,path,opts){
+  opts=opts||{};
+  return {
+    url:mp.url.replace(/\/+$/,'')+'/rest/v1/'+path,
+    method:opts.method||'GET',
+    headers:{apikey:mp.key,Authorization:'Bearer '+mp.key,
+      'Content-Type':'application/json',
+      Prefer:opts.prefer||'return=minimal'},
+    body:opts.body===undefined?undefined:JSON.stringify(opts.body)
+  };
+}
+function validMp(mp){
+  return !!(mp&&typeof mp.url==='string'&&/^https:\/\/[^\s\/]+\.[^\s\/]+$/.test(mp.url.replace(/\/+$/,''))&&
+            typeof mp.key==='string'&&mp.key.length>=20);
+}
+/* The anon key is public by design, so the join link can carry the whole
+   connection — a guest opens one URL and never sees a settings screen. */
+function encodeMpConfig(mp){
+  if(!validMp(mp)) return '';
+  return encodeURIComponent(mp.url.replace(/\/+$/,''))+'~'+encodeURIComponent(mp.key);
+}
+function decodeMpConfig(s){
+  if(!s||s.indexOf('~')<0) return null;
+  var i=s.indexOf('~'),mp;
+  try{ mp={url:decodeURIComponent(s.slice(0,i)).replace(/\/+$/,''),key:decodeURIComponent(s.slice(i+1))}; }
+  catch(e){ return null; }
+  return validMp(mp)?mp:null;
+}
+function parseHash(hash){
+  var out={}, s=String(hash||'');
+  if(s.indexOf('#')>=0) s=s.slice(s.indexOf('#')+1);   // accepts a bare hash or a whole URL
+  s.split('&').forEach(function(kv){
+    var i=kv.indexOf('='); if(i>0) out[kv.slice(0,i)]=kv.slice(i+1);
+  });
+  var code=(out.room||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  return {code:code||null,mp:decodeMpConfig(out.mp)};
+}
+function buildJoinLink(base,code,mp){
+  var h='#room='+encodeURIComponent(code||''), m=encodeMpConfig(mp);
+  if(m) h+='&mp='+m;
+  return String(base||'').split('#')[0]+h;
+}
+
+/* slippy-tile maths for the real map layer */
+function lon2tile(lng,z){return (lng+180)/360*Math.pow(2,z);}
+function lat2tile(lat,z){
+  var r=lat*Math.PI/180;
+  return (1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*Math.pow(2,z);
+}
+function tile2lon(x,z){return x/Math.pow(2,z)*360-180;}
+function tile2lat(y,z){
+  var n=Math.PI-2*Math.PI*y/Math.pow(2,z);
+  return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n)));
+}
+function tileMpp(lat,z){return 156543.03392*Math.cos(lat*Math.PI/180)/Math.pow(2,z);}
+function zoomForMpp(lat,mpp){
+  var z=Math.round(Math.log2(156543.03392*Math.cos(lat*Math.PI/180)/mpp));
+  return clampN(z,14,19);
+}
+
+/* human-scale references for the settings preview */
+var WALK=1.35, RUN=3.2, CAR=4.5;   // metres per second, metres
+function walkMins(m){return m/WALK/60;}
+function runDistance(secs){return secs*RUN;}
+function carLengths(m){return m/CAR;}
+function paceText(m){
+  var mins=walkMins(m);
+  if(mins<1) return Math.max(1,Math.round(m/0.75))+' steps';
+  return (mins<10?mins.toFixed(1):Math.round(mins))+' min walk';
+}
+function zonePlan(cfg){
+  var out=[cfg.areaR], r=cfg.areaR;
+  for(var i=0;i<CFG.zoneStages;i++){ r=Math.max(CFG.zoneMinR,r*CFG.zoneShrink); out.push(r); }
+  return out;
+}
+function previewMpp(mode,cfg,minDim){
+  var span;
+  if(mode==='catch') span=Math.max(24,CFG.catchRadius*2)*3;
+  else if(mode==='run') span=Math.max(60,runDistance(cfg.runSecs||60))*2.4;
+  else if(mode==='signal') span=Math.max(80,(cfg.unc||110))*2.6;
+  else span=cfg.areaR*2*1.22;
+  return span/Math.max(1,minDim);
+}
+function scaleBarFor(mpp,maxPx){
+  var steps=[5,10,20,25,50,100,200,250,500,1000];
+  for(var i=steps.length-1;i>=0;i--){ if(steps[i]/mpp<=maxPx) return {m:steps[i],px:steps[i]/mpp}; }
+  return {m:steps[0],px:steps[0]/mpp};
+}
+
+
+/* ---------- real street data (OpenStreetMap via Overpass) ---------- */
+/* A road you cannot run down is worse than no road at all: anything unbuilt,
+   demolished, indoors or barrier-like is dropped before it can be drawn or walked. */
+var HW_MAJOR=['motorway','trunk','primary','motorway_link','trunk_link','primary_link'];
+var HW_ROAD=['secondary','tertiary','secondary_link','tertiary_link','busway','bus_guideway'];
+var HW_MINOR=['residential','unclassified','living_street','service','road'];
+var HW_PATH=['footway','path','pedestrian','steps','cycleway','track','bridleway','corridor'];
+var HW_DROP=['construction','proposed','planned','abandoned','razed','demolished','disused',
+             'raceway','platform','elevator','rest_area','services','bus_stop','emergency_bay','escape'];
+function classifyWay(tags){
+  if(!tags) return null;
+  var h=tags.highway;
+  if(h){
+    if(HW_DROP.indexOf(h)>=0) return null;
+    if(tags.access==='private'&&h==='service') return null;
+    // a pedestrian square is ground, not a line — let the area rules below claim it
+    if(!(tags.area==='yes'&&(h==='pedestrian'||h==='footway'))){
+      if(HW_MAJOR.indexOf(h)>=0) return 'major';
+      if(HW_ROAD.indexOf(h)>=0) return 'road';
+      if(HW_MINOR.indexOf(h)>=0) return 'minor';
+      if(HW_PATH.indexOf(h)>=0) return 'path';
+      return null;
+    }
+  }
+  if(tags.building) return 'building';
+  if(tags.natural==='water'||tags.waterway||tags.landuse==='reservoir'||tags.landuse==='basin') return 'water';
+  if(tags.leisure==='park'||tags.leisure==='pitch'||tags.leisure==='garden'||tags.leisure==='playground'||
+     tags.leisure==='recreation_ground'||tags.landuse==='grass'||tags.landuse==='forest'||
+     tags.landuse==='meadow'||tags.landuse==='recreation_ground'||tags.natural==='wood'||
+     tags.natural==='scrub'||h==='pedestrian'||h==='footway') return 'park';
+  return null;
+}
+function overpassQuery(centre,radius){
+  var R=Math.round(Math.min(1600,radius)), a=centre.lat.toFixed(6)+','+centre.lng.toFixed(6);
+  var b=R<=700?'way["building"](around:'+R+','+a+');':'';
+  // every branch here has a matching case in classifyWay — an unmatched fetch is wasted bandwidth,
+  // and an unfetched case is a classifier rule that can never fire.
+  return '[out:json][timeout:25];('+
+    'way["highway"](around:'+R+','+a+');'+
+    'way["natural"~"^(water|wood|scrub)$"](around:'+R+','+a+');'+
+    'way["waterway"~"^(river|stream|canal|drain)$"](around:'+R+','+a+');'+
+    'way["leisure"~"^(park|pitch|garden|playground|recreation_ground)$"](around:'+R+','+a+');'+
+    'way["landuse"~"^(grass|forest|meadow|recreation_ground|reservoir|basin)$"](around:'+R+','+a+');'+
+    b+');out geom;';
+}
+/* Overpass is a volunteer service that rate-limits hard. One endpoint is a single
+   point of failure; the fetcher walks this list until something answers. */
+var OVERPASS=['https://overpass-api.de/api/interpreter',
+              'https://overpass.kumi.systems/api/interpreter',
+              'https://overpass.private.coffee/api/interpreter',
+              'https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
+function parseOverpass(json,centre){
+  var out=[],els=(json&&json.elements)||[];
+  var mPerLat=EARTH*Math.PI/180, mPerLng=mPerLat*Math.cos(centre.lat*Math.PI/180);
+  for(var i=0;i<els.length;i++){
+    var e=els[i]; if(!e.geometry||e.geometry.length<2) continue;
+    var k=classifyWay(e.tags); if(!k) continue;
+    var pts=[],minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;
+    for(var j=0;j<e.geometry.length;j++){
+      var g=e.geometry[j];
+      var x=Math.round((g.lon-centre.lng)*mPerLng*10)/10;
+      var y=Math.round((g.lat-centre.lat)*mPerLat*10)/10;
+      pts.push(x,y);
+      if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y;
+    }
+    var closed=(pts[0]===pts[pts.length-2]&&pts[1]===pts[pts.length-1]);
+    out.push({k:k,p:pts,b:[minx,miny,maxx,maxy],a:(k==='building'||k==='water'||k==='park')&&closed});
+  }
+  return out;
+}
+function wayVisible(w,view){ // view = [minx,miny,maxx,maxy] in metres
+  return !(w.b[2]<view[0]||w.b[0]>view[2]||w.b[3]<view[1]||w.b[1]>view[3]);
+}
+function streetsCacheKey(centre,radius){
+  return 'fs:map:'+centre.lat.toFixed(3)+','+centre.lng.toFixed(3)+':'+Math.round(radius/100)*100;
+}
+/* ---------- road graph -------------------------------------------------
+   Parsed ways are just polylines for the renderer. The graph turns the walkable
+   ones into segments in a coarse spatial grid, so the game can ask "where is the
+   nearest place a person could actually stand?" without scanning every way.
+   All coordinates are metres east/north of STREETS.centre, same as w.p. */
+function localFrom(centre,p){
+  return {x:metersBetween({lat:centre.lat,lng:centre.lng},{lat:centre.lat,lng:p.lng})*(p.lng>centre.lng?1:-1),
+          y:metersBetween({lat:centre.lat,lng:centre.lng},{lat:p.lat,lng:centre.lng})*(p.lat>centre.lat?1:-1)};
+}
+function isWalkable(k){return k==='major'||k==='road'||k==='minor'||k==='path';}
+function buildRoadGraph(ways,cell){
+  cell=cell||CFG.roadCell;
+  var g={seg:[],grid:{},cell:cell,n:0};
+  for(var i=0;i<((ways&&ways.length)||0);i++){
+    var w=ways[i];
+    if(!w||!w.p||w.p.length<4||w.a||!isWalkable(w.k)) continue;
+    for(var j=0;j+3<w.p.length;j+=2){
+      var x1=w.p[j],y1=w.p[j+1],x2=w.p[j+2],y2=w.p[j+3];
+      if(x1===x2&&y1===y2) continue;
+      var idx=g.seg.length;
+      g.seg.push(x1,y1,x2,y2);
+      var i0=Math.floor(Math.min(x1,x2)/cell), i1=Math.floor(Math.max(x1,x2)/cell);
+      var j0=Math.floor(Math.min(y1,y2)/cell), j1=Math.floor(Math.max(y1,y2)/cell);
+      for(var a=i0;a<=i1;a++) for(var b=j0;b<=j1;b++){
+        var key=a+','+b; if(!g.grid[key]) g.grid[key]=[];
+        g.grid[key].push(idx);
+      }
+      g.n++;
+    }
+  }
+  return g;
+}
+function closestOnSegment(px,py,x1,y1,x2,y2){
+  var dx=x2-x1, dy=y2-y1, l2=dx*dx+dy*dy;
+  if(l2===0) return {x:x1,y:y1,t:0};
+  var t=((px-x1)*dx+(py-y1)*dy)/l2; t=t<0?0:t>1?1:t;
+  return {x:x1+t*dx,y:y1+t*dy,t:t};
+}
+function normDir(dx,dy){var l=Math.sqrt(dx*dx+dy*dy)||1;return {x:dx/l,y:dy/l};}
+function snapToRoad(g,x,y,maxD){
+  if(!g||!g.n) return null;
+  maxD=maxD||CFG.snapRadius;
+  var cell=g.cell, best=null, bd=maxD*maxD;
+  var r=Math.ceil(maxD/cell), ci=Math.floor(x/cell), cj=Math.floor(y/cell), seen={};
+  for(var a=-r;a<=r;a++) for(var b=-r;b<=r;b++){
+    var list=g.grid[(ci+a)+','+(cj+b)]; if(!list) continue;
+    for(var i=0;i<list.length;i++){
+      var s=list[i]; if(seen[s]) continue; seen[s]=1;
+      var p=closestOnSegment(x,y,g.seg[s],g.seg[s+1],g.seg[s+2],g.seg[s+3]);
+      var d=(p.x-x)*(p.x-x)+(p.y-y)*(p.y-y);
+      if(d<bd){ bd=d; best={x:p.x,y:p.y,d:Math.sqrt(d),seg:s,
+        dir:normDir(g.seg[s+2]-g.seg[s],g.seg[s+3]-g.seg[s+1])}; }
+    }
+  }
+  return best;
+}
+/* A random point that is actually on a street, inside `radius` of (cx,cy).
+   Returns null when there is no road data — callers must keep working without it. */
+function roadPointNear(g,rng,cx,cy,radius,tries){
+  if(!g||!g.n) return null;
+  tries=tries||24;
+  for(var i=0;i<tries;i++){
+    var d=Math.sqrt(rng())*radius, a=rng()*Math.PI*2;
+    var p=snapToRoad(g,cx+Math.cos(a)*d,cy+Math.sin(a)*d,Math.max(CFG.snapRadius,radius*0.4));
+    if(!p) continue;
+    var dx=p.x-cx, dy=p.y-cy;
+    if(dx*dx+dy*dy<=radius*radius) return p;
+  }
+  return null;
+}
+/* Nudges a mover back onto the nearest street and points it along the street's
+   direction, so bots follow the road rather than cutting through houses. */
+function followRoad(g,x,y,vx,vy,pull){
+  var s=snapToRoad(g,x,y,CFG.snapRadius);
+  if(!s) return {x:x,y:y,vx:vx,vy:vy,on:false};
+  pull=pull===undefined?0.5:pull;
+  var along=(vx*s.dir.x+vy*s.dir.y)>=0?1:-1;
+  var nvx=vx+(s.dir.x*along-vx)*pull, nvy=vy+(s.dir.y*along-vy)*pull;
+  var l=Math.sqrt(nvx*nvx+nvy*nvy)||1;
+  return {x:x+(s.x-x)*pull, y:y+(s.y-y)*pull, vx:nvx/l, vy:nvy/l, on:true};
+}
+
+function ROAD_STYLE(k){
+  return {major:{w:9,c:'#3d4560',cc:'#20242f'},
+          road:{w:7,c:'#39415a',cc:'#20242f'},
+          minor:{w:5,c:'#333b52',cc:'#1e222d'},
+          path:{w:2,c:'#4a5470',cc:null,dash:[4,4]}}[k]||null;
+}
+
+var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetLatLng,CFG:CFG,
+  schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,nextZone:nextZone,
+  zoneContains:zoneContains,zoneStageTimes:zoneStageTimes,trackingBand:trackingBand,makeBlip:makeBlip,
+  canCatch:canCatch,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
+  factionCounts:factionCounts,checkWin:checkWin,outsideState:outsideState,pickMission:pickMission,
+  missionTick:missionTick,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
+  catchDistance:catchDistance,makeGpsFilter:makeGpsFilter,gpsQuality:gpsQuality,
+  classifyWay:classifyWay,overpassQuery:overpassQuery,parseOverpass:parseOverpass,
+  wayVisible:wayVisible,streetsCacheKey:streetsCacheKey,ROAD_STYLE:ROAD_STYLE,OVERPASS:OVERPASS,
+  localFrom:localFrom,isWalkable:isWalkable,buildRoadGraph:buildRoadGraph,snapToRoad:snapToRoad,
+  closestOnSegment:closestOnSegment,roadPointNear:roadPointNear,followRoad:followRoad,
+  reachableSpot:reachableSpot,
+  newActions:newActions,mergePlayerInput:mergePlayerInput,pendingActions:pendingActions,
+  presence:presence,presentVoters:presentVoters,lostHiders:lostHiders,hostAlive:hostAlive,
+  supaRequest:supaRequest,validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
+  parseHash:parseHash,buildJoinLink:buildJoinLink,
+  walkMins:walkMins,runDistance:runDistance,carLengths:carLengths,paceText:paceText,
+  zonePlan:zonePlan,previewMpp:previewMpp,scaleBarFor:scaleBarFor,
+  lon2tile:lon2tile,lat2tile:lat2tile,tile2lon:tile2lon,tile2lat:tile2lat,tileMpp:tileMpp,zoomForMpp:zoomForMpp};
+if(typeof module!=='undefined'&&module.exports) module.exports=CORE;
+/* ============================================================
+   CORE_END
+   ============================================================ */
+
+/* ============================================================
+   PART 2 — runtime: state, net sync, sprites, map, UI
+   ============================================================ */
+var $=function(s){return document.querySelector(s);};
+var $$=function(s){return Array.prototype.slice.call(document.querySelectorAll(s));};
+var now=function(){return Date.now();};
+var clamp=function(v,a,b){return v<a?a:v>b?b:v;};
+var pad=function(n){n=Math.max(0,Math.floor(n));return (n<10?'0':'')+n;};
+var mmss=function(s){return pad(s/60)+':'+pad(s%60);};
+
+var G={
+  me:{id:null,name:'',char:0},
+  mode:'solo',           // 'solo' | 'net'
+  code:null, isHost:false, st:null,
+  pos:null,              // {lat,lng,acc,t}
+  gps:'unknown',         // unknown|ok|denied|weak|virtual
+  seq:0, outbox:[], lastSeq:{},
+  seenEvent:0, seenAlerts:{},
+  view:{lat:0,lng:0,mpp:1.2},
+  render:{},             // interpolated sprite positions
+  bots:[], dev:false, simMove:false,
+  cfg:{matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
+       fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,objectives:1,
+       gpsForgive:1,mapStyle:'real'},
+  mp:null,               // {url,key} — Supabase project, from the join link or setup screen
+  ack:0,                 // highest action seq the host has confirmed
+  dropped:{},            // host-side: ids pruned from the lobby, and the row that did it
+  netBusy:false, flush:false, lastPush:0, lastGoodPull:0, netErr:0, joinLink:'',
+  blipCache:{}, rng:mulberry32(now()&0xffffffff)
+};
+
+/* ---------- tiny audio (WebAudio, no assets) ---------- */
+var AC=null;
+function ac(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}} return AC; }
+function tone(f,dur,type,vol,slide){
+  var c=ac(); if(!c) return;
+  var o=c.createOscillator(),g=c.createGain();
+  o.type=type||'square'; o.frequency.setValueAtTime(f,c.currentTime);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40,slide),c.currentTime+dur);
+  g.gain.setValueAtTime(0.0001,c.currentTime);
+  g.gain.exponentialRampToValueAtTime(vol||0.12,c.currentTime+0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001,c.currentTime+dur);
+  o.connect(g);g.connect(c.destination);o.start();o.stop(c.currentTime+dur+0.02);
+}
+var SFX={
+  tap:function(){tone(520,0.05,'square',0.06);},
+  ok:function(){tone(440,0.08,'square',0.09);setTimeout(function(){tone(660,0.12,'square',0.09);},70);},
+  bad:function(){tone(180,0.18,'sawtooth',0.10,90);},
+  alarm:function(){tone(880,0.1,'square',0.10);setTimeout(function(){tone(660,0.16,'square',0.10);},110);},
+  caught:function(){tone(300,0.3,'sawtooth',0.14,60);setTimeout(function(){tone(140,0.5,'sawtooth',0.12,50);},180);},
+  tick:function(){tone(900,0.04,'square',0.05);},
+  reveal:function(){[330,440,550,660].forEach(function(f,i){setTimeout(function(){tone(f,0.12,'triangle',0.09);},i*90);});},
+  glitch:function(){for(var i=0;i<6;i++){(function(i){setTimeout(function(){tone(200+Math.random()*900,0.04,'square',0.07);},i*45);})(i);}}
+};
+function buzz(ms){ if(navigator.vibrate) try{navigator.vibrate(ms);}catch(e){} }
+
+/* ---------- 12 pixel runners (procedural, one cohesive style) ---------- */
+var CHARS=[
+  {n:'Ash',   skin:'#e8b78f',hair:'#3b2b25',top:'#e0553f',bot:'#33395c',hat:'none',  style:'short'},
+  {n:'Bex',   skin:'#f2cfa8',hair:'#c9722f',top:'#4aa3d8',bot:'#2c2c3a',hat:'beanie',style:'long'},
+  {n:'Cru',   skin:'#8a5c3d',hair:'#161016',top:'#63c77c',bot:'#3d4463',hat:'cap',   style:'short'},
+  {n:'Dot',   skin:'#f4d9bb',hair:'#f0d24a',top:'#a05ce0',bot:'#2f3550',hat:'none',  style:'bun'},
+  {n:'Eli',   skin:'#6b4630',hair:'#2a1c18',top:'#f2a63b',bot:'#33395c',hat:'hood',  style:'short'},
+  {n:'Fig',   skin:'#e8b78f',hair:'#6b4bb0',top:'#2e2748',bot:'#4a5478',hat:'none',  style:'long'},
+  {n:'Gus',   skin:'#d59a72',hair:'#7a5230',top:'#f2ecdf',bot:'#3b4a2f',hat:'cap',   style:'short'},
+  {n:'Hux',   skin:'#f2cfa8',hair:'#1f1a2e',top:'#2f7fbc',bot:'#22243a',hat:'hood',  style:'short'},
+  {n:'Iris',  skin:'#8a5c3d',hair:'#4a2f6b',top:'#e05a8c',bot:'#2c3350',hat:'none',  style:'bun'},
+  {n:'Jax',   skin:'#e8b78f',hair:'#b8b2c8',top:'#3ec2b8',bot:'#33395c',hat:'beanie',style:'short'},
+  {n:'Kit',   skin:'#f4d9bb',hair:'#2b2320',top:'#c8452f',bot:'#5a5a6e',hat:'none',  style:'long'},
+  {n:'Lark',  skin:'#6b4630',hair:'#141019',top:'#6e8f3a',bot:'#2a2f47',hat:'cap',   style:'short'}
+];
+// 14 x 18 grid character
+function drawChar(ctx,idx,dir,frame,S,ox,oy,alpha){
+  var d=CHARS[idx%CHARS.length]; if(!d) return;
+  ctx.save(); if(alpha!==undefined) ctx.globalAlpha=alpha;
+  function P(x,y,w,h,c){ctx.fillStyle=c;ctx.fillRect(ox+x*S,oy+y*S,w*S,h*S);}
+  var bob=(frame===1)?1:0;
+  var dark=function(c){return c;};
+  // backpack (behind)
+  if(idx%3===1) P(3,7+bob,8,6,'#00000055');
+  // hair back / long
+  if(d.style==='long') P(3,3+bob,8,7,d.hair);
+  if(d.style==='bun') P(5,1+bob,4,2,d.hair);
+  // head
+  P(4,3+bob,6,5,d.skin);
+  // hair top + fringe
+  if(d.hat==='none'||d.hat==='hood') P(4,2+bob,6,2,d.hair);
+  if(d.hat==='beanie'){P(4,1+bob,6,3,d.top);P(4,1+bob,6,1,'#ffffff33');}
+  if(d.hat==='cap'){P(4,1+bob,6,2,d.top);
+    if(dir==='S')P(3,3+bob,8,1,d.top); if(dir==='E')P(9,3+bob,3,1,d.top); if(dir==='W')P(2,3+bob,3,1,d.top);}
+  if(d.hat==='hood'){P(3,2+bob,8,5,d.top);P(4,3+bob,6,4,d.skin);}
+  // face
+  if(dir==='S'){P(5,5+bob,1,1,'#1a1420');P(8,5+bob,1,1,'#1a1420');}
+  else if(dir==='E'){P(8,5+bob,1,1,'#1a1420');}
+  else if(dir==='W'){P(5,5+bob,1,1,'#1a1420');}
+  // torso
+  P(4,8+bob,6,5,d.top);
+  P(4,8+bob,6,1,'#ffffff22');
+  // arms
+  var sw=(frame===1)?1:0;
+  if(dir==='E'){P(9,9+bob+sw,2,4,d.top);P(9,12+bob+sw,2,1,d.skin);}
+  else if(dir==='W'){P(3,9+bob+sw,2,4,d.top);P(3,12+bob+sw,2,1,d.skin);}
+  else{P(2,9+bob+sw,2,4,d.top);P(10,9+bob-sw,2,4,d.top);
+       P(2,12+bob+sw,2,1,d.skin);P(10,12+bob-sw,2,1,d.skin);}
+  // legs
+  if(frame===1){P(4,13+bob,3,4,d.bot);P(8,13+bob,2,3,d.bot);P(8,16+bob,3,1,'#1a1420');P(3,17,3,1,'#1a1420');}
+  else{P(4,13,2,4,d.bot);P(8,13,2,4,d.bot);P(4,17,2,1,'#1a1420');P(8,17,2,1,'#1a1420');}
+  ctx.restore();
+}
+function paintChar(cv,idx,dir,frame){
+  var ctx=cv.getContext('2d'); ctx.clearRect(0,0,cv.width,cv.height);
+  var S=Math.floor(Math.min(cv.width/14,cv.height/18));
+  drawChar(ctx,idx,dir||'S',frame||0,S,(cv.width-14*S)/2,(cv.height-18*S)/2);
+}
+
+/* ---------- storage / room sync ----------
+   Two different things live here and they used to be tangled together:
+   - local persistence (profile, cached street data) via window.storage when the
+     host page provides it. Optional; the game runs fine without it.
+   - the room transport, which is what multiplayer actually is. That now goes
+     through NET, which has two adapters: Supabase over plain REST (works from
+     any static host, phone to phone) and the window.storage bridge (only works
+     inside a host page that injects it). */
+function hasStore(){return !!(window.storage&&window.storage.get);}
+function K(code,suffix){return 'fs:'+code+(suffix||'');}
+function sput(k,v){ if(!hasStore()) return Promise.reject('nostore');
+  return window.storage.set(k,JSON.stringify(v),true); }
+function sget(k){ if(!hasStore()) return Promise.reject('nostore');
+  return window.storage.get(k,true).then(function(r){return r?JSON.parse(r.value):null;}); }
+function slist(prefix){ if(!hasStore()) return Promise.resolve([]);
+  return window.storage.list(prefix,true).then(function(r){return (r&&r.keys)||[];}).catch(function(){return [];}); }
+
+var NET={kind:'none',mp:null,lastErr:null,ok:0,fails:0,lastOkAt:0};
+function netKind(){
+  if(validMp(G.mp)) return 'supabase';
+  if(hasStore()) return 'storage';
+  return 'none';
+}
+function netRefresh(){ NET.kind=netKind(); NET.mp=NET.kind==='supabase'?G.mp:null; return NET.kind; }
+function netAvailable(){ return netRefresh()!=='none'; }
+function netLabel(){
+  return NET.kind==='supabase'?'Supabase':NET.kind==='storage'?'Host bridge':'None';
+}
+function netNote(e){
+  NET.fails++; NET.lastErr=(e&&e.message)||String(e||'error');
+  G.netErr++;
+  throw e;
+}
+function netGood(v){ NET.ok++; NET.lastOkAt=now(); G.netErr=0; return v; }
+
+function supaCall(path,opts){
+  var r=supaRequest(NET.mp,path,opts);
+  return fetch(r.url,{method:r.method,headers:r.headers,body:r.body,cache:'no-store'})
+    .then(function(res){
+      if(!res.ok) return res.text().then(function(t){
+        throw new Error('HTTP '+res.status+(t?' — '+t.slice(0,140):''));
+      });
+      return r.method==='GET'?res.json():null;
+    });
+}
+var UPSERT='resolution=merge-duplicates,return=minimal';
+
+/* The whole room state goes over the wire several times a minute for every player,
+   so anything the other phones cannot use is pure bandwidth. Host-only bookkeeping
+   is stripped and the event log is trimmed to what a client could still be behind on. */
+function wireState(st){
+  var w={},k;
+  for(k in st) if(Object.prototype.hasOwnProperty.call(st,k)) w[k]=st[k];
+  delete w._last;
+  w.events=(st.events||[]).slice(-20);
+  w.objectives=(st.objectives||[]).map(function(o){
+    return {id:o.id,lat:o.lat,lng:o.lng,type:o.type,claimedBy:o.claimedBy};
+  });
+  return w;
+}
+function netPutState(code,st){
+  var body=wireState(st);
+  if(NET.kind==='supabase')
+    return supaCall('fs_rooms?on_conflict=code',
+      {method:'POST',prefer:UPSERT,body:[{code:code,state:body}]}).then(netGood,netNote);
+  if(NET.kind==='storage') return sput(K(code,':s'),body).then(netGood,netNote);
+  return Promise.reject(new Error('no transport'));
+}
+function netDeleteInput(code,id){
+  if(NET.kind==='supabase')
+    return supaCall('fs_inputs?code=eq.'+encodeURIComponent(code)+
+      '&player_id=eq.'+encodeURIComponent(id),{method:'DELETE'}).catch(function(){return null;});
+  if(NET.kind==='storage'&&window.storage&&window.storage.delete)
+    return Promise.resolve(window.storage.delete(K(code,':p:'+id),true)).catch(function(){return null;});
+  return Promise.resolve(null);
+}
+function netGetState(code){
+  if(NET.kind==='supabase')
+    return supaCall('fs_rooms?code=eq.'+encodeURIComponent(code)+'&select=state')
+      .then(function(rows){ return (rows&&rows[0])?rows[0].state:null; }).then(netGood,netNote);
+  if(NET.kind==='storage') return sget(K(code,':s')).then(netGood,netNote);
+  return Promise.reject(new Error('no transport'));
+}
+function netPutInput(code,id,input){
+  if(NET.kind==='supabase')
+    return supaCall('fs_inputs?on_conflict=code,player_id',
+      {method:'POST',prefer:UPSERT,body:[{code:code,player_id:id,input:input}]}).then(netGood,netNote);
+  if(NET.kind==='storage') return sput(K(code,':p:'+id),input).then(netGood,netNote);
+  return Promise.reject(new Error('no transport'));
+}
+function netListInputs(code){
+  if(NET.kind==='supabase')
+    return supaCall('fs_inputs?code=eq.'+encodeURIComponent(code)+'&select=input')
+      .then(function(rows){ return (rows||[]).map(function(r){return r.input;}); }).then(netGood,netNote);
+  if(NET.kind==='storage')
+    return slist(K(code,':p:')).then(function(keys){
+      return Promise.all(keys.map(function(k){return sget(k).catch(function(){return null;});}));
+    }).then(netGood,netNote);
+  return Promise.reject(new Error('no transport'));
+}
+/* A fresh room must not inherit input rows from whatever used this code before. */
+function netClearInputs(code){
+  if(NET.kind==='supabase')
+    return supaCall('fs_inputs?code=eq.'+encodeURIComponent(code),{method:'DELETE'})
+      .then(netGood,function(e){ NET.lastErr=(e&&e.message)||'delete failed'; return null; });
+  return Promise.resolve(null);
+}
+/* One cheap round trip that proves the credentials and the tables are real,
+   so a host finds out on the setup screen and not in front of six kids. */
+function netTest(){
+  if(!validMp(G.mp)) return Promise.reject(new Error('Enter a project URL and anon key first.'));
+  NET.kind='supabase'; NET.mp=G.mp;
+  var probe='TEST'+Math.floor(Math.random()*100000);
+  return netPutState(probe,{code:probe,probe:true})
+    .then(function(){ return netGetState(probe); })
+    .then(function(s){
+      if(!s||!s.probe) throw new Error('Wrote the room but could not read it back — check the table policies.');
+      return true;
+    });
+}
+
+var MP_SQL=[
+  '-- Run this once in the Supabase SQL editor.',
+  'create table if not exists fs_rooms (',
+  '  code text primary key,',
+  '  state jsonb not null,',
+  '  updated_at timestamptz not null default now());',
+  '',
+  'create table if not exists fs_inputs (',
+  '  code text not null,',
+  '  player_id text not null,',
+  '  input jsonb not null,',
+  '  updated_at timestamptz not null default now(),',
+  '  primary key (code, player_id));',
+  '',
+  'alter table fs_rooms  enable row level security;',
+  'alter table fs_inputs enable row level security;',
+  '',
+  '-- Anyone with the anon key can play. Same trust model as a room code:',
+  '-- knowing the code is knowing the room.',
+  'create policy fs_rooms_all  on fs_rooms  for all to anon using (true) with check (true);',
+  'create policy fs_inputs_all on fs_inputs for all to anon using (true) with check (true);'
+].join('\n');
+
+function newCode(){
+  var A='ACDEFGHJKLMNPQRSTUVWXYZ23456789',s='';
+  for(var i=0;i<5;i++) s+=A[Math.floor(Math.random()*A.length)];
+  return s;
+}
+function uid(){return Math.random().toString(36).slice(2,10);}
+
+/* ---------- match state factory ---------- */
+function newMatch(code,hostId,cfg,centre){
+  return {
+    code:code, hostId:hostId, phase:'LOBBY', cfg:cfg, t0:null, ver:0,
+    players:{}, zone:{lat:centre.lat,lng:centre.lng,r:cfg.areaR}, next:null,
+    zoneStage:0, zoneCloseAt:null, zonePreviewAt:null,
+    imposterId:null, imposterEligible:false, imposterPower:true,
+    mission:null, tips:0, tipsSent:[],
+    tribunal:null, tribunalsDone:0, fullSignalUntil:0,
+    blips:[], objectives:[], jammedUntil:0,
+    ack:{}, hostAt:now(),
+    events:[], evId:0, winner:null, endedAt:null, seed:(Math.random()*1e9)|0
+  };
+}
+function newPlayer(id,name,ch,host){
+  return {id:id,name:name,char:ch,host:!!host,role:'hider',caught:false,convertAt:null,
+    lat:null,lng:null,locT:0,outsideSince:null,exposedUntil:0,seen:0,
+    stats:{catches:0,missions:0,leaks:0,votes:0,exposed:0,dist:0,survived:0},lastAct:0};
+}
+
+/* ---------- events ---------- */
+function pushEvent(st,to,kind,title,body,sub){
+  st.evId++;
+  st.events.push({id:st.evId,to:to,kind:kind,title:title,body:body,sub:sub,t:now()});
+  if(st.events.length>40) st.events=st.events.slice(-40);
+}
+function eventForMe(ev){
+  var me=G.st&&G.st.players[G.me.id]; if(!me) return false;
+  if(ev.to==='all') return true;
+  if(ev.to==='seekers') return me.role==='seeker';
+  if(ev.to==='hiders') return me.role!=='seeker'&&!me.caught;
+  return ev.to===G.me.id;
+}
+
+/* ============================================================
+   PART 3 — host simulation, bots, networking, location
+   ============================================================ */
+function me(){ return G.st?G.st.players[G.me.id]:null; }
+function isSeeker(){ var p=me(); return !!p&&p.role==='seeker'; }
+function matchT(){ return G.st&&G.st.t0?(now()-G.st.t0)/1000:0; }
+function progress(){ var s=schedule(G.st.cfg); return clamp(huntClock(matchT())/s.end,0,1); }
+
+function hostSim(){
+  var st=G.st; if(!st||st.phase==='LOBBY'||st.phase==='RESULTS') return;
+  var n=now(), t=(n-st.t0)/1000, ph=phaseFor(t,st.cfg), hc=huntClock(t);
+  var dt=(n-(st._last||n))/1000; st._last=n; if(dt<=0) dt=0.001;
+  var rng=mulberry32((st.seed+Math.floor(n/1000))|0);
+
+  /* --- phase transitions --- */
+  if(ph!==st.phase){
+    var prev=st.phase; st.phase=ph;
+    if(ph==='HUNT_1'){
+      pushEvent(st,'all','hunt','THE HUNT HAS BEGUN','Seekers are moving. Stay out of sight.');
+      if(CFG.objectives) spawnObjectives(st,rng);
+      if(st.imposterId&&st.imposterEligible) newMission(st,rng);
+    }
+    if((prev==='TRIBUNAL_1'||prev==='FINAL_TRIBUNAL')&&st.tribunal&&!st.tribunal.done) resolveTribunal(st);
+    if(ph==='RESULTS'){ endMatch(st); return; }
+  }
+
+  /* --- tribunals (survives backgrounding: never silently skipped) --- */
+  var s=schedule(st.cfg);
+  var want=0;
+  for(var mi=0;mi<s.marks.length;mi++){ if(hc>=s.marks[mi]&&st.tribunalsDone===mi){ want=mi+1; break; } }
+  if(want&&(!st.tribunal||st.tribunal.done)&&st.phase!=='RESULTS'){
+    st.tribunal={which:want,endsAt:n+CFG.voteLen*1000,endsHc:s.marks[want-1]+s.V,votes:{},done:false};
+    pushEvent(st,'all','vote','TRIBUNAL','Everyone still uncaught votes now. Who is the imposter?');
+  }
+
+  /* --- vote warning --- */
+  s.marks.forEach(function(mark,i){
+    var key='warn'+i;
+    if(!st[key]&&hc>=mark-60&&hc<mark){ st[key]=1; pushEvent(st,'all','warn','VOTE IN 60 SECONDS','Think about who you trust.'); }
+  });
+
+  /* --- zone schedule --- */
+  var times=zoneStageTimes(st.cfg);
+  if(st.zoneStage<times.length){
+    var target=times[st.zoneStage];
+    if(!st.next&&hc>=target-CFG.zonePreview){
+      st.next=nextZone(mulberry32((st.seed+st.zoneStage*977)|0),st.zone);
+      st.zoneCloseAt=st.t0+(CFG.scatter+target)*1000;
+      pushEvent(st,'all','zone','NEXT ZONE REVEALED','The safe area is moving. Look at the small circle.');
+    }
+    if(st.next&&hc>=target&&!st.closing){ st.closing={from:JSON.parse(JSON.stringify(st.zone)),at:n};
+      pushEvent(st,'all','zone','ZONE IS CLOSING','Get inside the new circle.'); }
+    if(st.closing&&(n-st.closing.at>=CFG.zoneClose*1000||hc>=target+CFG.zoneClose)){
+      st.zone=st.next; st.next=null; st.closing=null; st.zoneStage++; st.zoneCloseAt=null;
+    }
+  }
+
+  /* --- dropped phones ---
+     A hider whose battery died would otherwise sit in the uncaught list forever and
+     make a seeker win impossible. Nobody is eliminated: they are caught like anyone
+     else, convert on the usual timer, and can rejoin straight into the hunt. */
+  lostHiders(st.players,n).forEach(function(id){
+    var p=st.players[id];
+    p.caught=true; p.convertAt=n+CFG.conversion*1000; p.outsideSince=null; p.dropped=true;
+    pushEvent(st,'all','caught','SIGNAL LOST',p.name+" dropped out of contact and has been caught.");
+  });
+
+  /* --- players --- */
+  Object.keys(st.players).forEach(function(id){
+    var p=st.players[id];
+    if(p.caught&&p.convertAt&&n>=p.convertAt&&p.role!=='seeker'){
+      p.role='seeker'; p.caught=false; p.convertAt=null; p.wasCaught=true;
+      pushEvent(st,id,'convert','YOU ARE NOW A SEEKER','Go and find the others.');
+      pushEvent(st,'all','newseeker','NEW SEEKER ACTIVE',p.name+' has joined the hunt.');
+    }
+    if(p.role==='seeker'||p.caught||p.lat==null) return;
+    // zone pressure
+    var os=outsideState(p,st.zone,n);
+    if(os.outside){ if(!p.outsideSince) p.outsideSince=n; }
+    else p.outsideSince=null;
+    if(os.level>0){ p.exposedUntil=n+6000; if(os.level>1) p.liveUntil=n+6000; p.stats.exposed++; }
+    p.stats.survived=hc;
+  });
+
+  /* --- seeker blips --- */
+  var band=trackingBand(clamp(hc/s.end,0,1));
+  var jam=n<st.jammedUntil;
+  st.blips=(st.blips||[]).filter(function(b){return b.until>n;});
+  Object.keys(st.players).forEach(function(id){
+    var p=st.players[id];
+    if(p.role==='seeker'||p.caught||p.lat==null) return;
+    var every=(n<p.exposedUntil)?12:band.every;
+    if(n-(p.lastBlip||0)>every*1000){
+      p.lastBlip=n;
+      var b=makeBlip(mulberry32((st.seed+n)|0),p,clamp(hc/s.end,0,1),jam);
+      st.blips.push({lat:b.lat,lng:b.lng,r:(n<p.exposedUntil?b.r*0.5:b.r),until:n+Math.min(30,every*0.9)*1000,src:id});
+    }
+  });
+
+  /* --- imposter mission --- */
+  if(st.imposterId&&st.imposterEligible&&st.mission&&st.phase.indexOf('HUNT')===0){
+    var imp=st.players[st.imposterId];
+    if(imp&&!imp.caught&&imp.lat!=null){
+      var r=missionTick(st.mission,imp,st.players,dt);
+      st.mission.active=r.active;
+      if(r.done){
+        imp.stats.missions++;
+        if(st.mission.type==='FOLLOW'){
+          var tgt=st.players[st.mission.targetId];
+          if(tgt&&tgt.lat!=null){
+            st.blips.push({lat:tgt.lat,lng:tgt.lng,r:35,until:n+45000,src:tgt.id,leak:true});
+            imp.stats.leaks++;
+            pushEvent(st,'seekers','tip','SECRET TIP','Hider activity detected in this area.');
+            pushEvent(st,st.imposterId,'mission','MISSION COMPLETE',(tgt.name)+"'s area has been leaked. Nobody knows it was you.");
+          }
+        } else {
+          st.tips++;
+          pushEvent(st,st.imposterId,'mission','MISSION COMPLETE','You earned a secret tip. Send it whenever you like.');
+        }
+        st.mission=null; st.missionNextAt=n+20000;
+      }
+    }
+  }
+  if(st.imposterId&&st.imposterEligible&&!st.mission&&st.phase.indexOf('HUNT')===0&&n>(st.missionNextAt||0)) newMission(st,mulberry32((st.seed+n)|0));
+
+  /* --- objectives --- */
+  (st.objectives||[]).forEach(function(o){
+    if(o.claimedBy) return;
+    Object.keys(st.players).forEach(function(id){
+      var p=st.players[id]; if(p.role==='seeker'||p.caught||p.lat==null) return;
+      if(metersBetween(p,o)<=CFG.objectiveRadius){
+        o.prog=o.prog||{}; o.prog[id]=(o.prog[id]||0)+dt;
+        if(o.prog[id]>=CFG.objectiveTime){
+          o.claimedBy=id;
+          if(o.type==='JAMMER'){ st.jammedUntil=n+90000;
+            pushEvent(st,'hiders','obj','SIGNAL JAMMER ACTIVE','Seeker scans are unreliable for 90 seconds.');
+          } else {
+            var cleared=Object.keys(st.players).filter(function(x){
+              var q=st.players[x]; return x!==id&&x!==st.imposterId&&q.role!=='seeker'&&!q.caught;});
+            var nm=cleared.length?st.players[cleared[Math.floor(Math.random()*cleared.length)]].name:null;
+            pushEvent(st,id,'obj','INTEL FOUND',nm?(nm+' is NOT the imposter.'):'No one else is left to clear.');
+          }
+        }
+      } else if(o.prog) o.prog[id]=0;
+    });
+  });
+  if(CFG.objectives&&(st.objectives||[]).filter(function(o){return !o.claimedBy;}).length<2&&st.phase.indexOf('HUNT')===0) spawnObjectives(st,rng);
+
+  /* --- tribunal resolution --- */
+  if(st.tribunal&&!st.tribunal.done&&(n>=st.tribunal.endsAt||hc>=(st.tribunal.endsHc||1e9))) resolveTribunal(st);
+
+  /* --- bots --- */
+  if(G.bots.length) botTick(st,dt,n);
+
+  /* --- win --- */
+  var w=checkWin(st,t);
+  if(w) endMatch(st,w);
+}
+
+/* Everything a player is told to physically walk to is placed with the road graph
+   when there is one, so "reach the purple marker" never means wading a river. */
+function roadsCtx(){
+  return (STREETS.status==='ok'&&STREETS.graph&&STREETS.graph.n&&STREETS.centre)
+    ? {centre:STREETS.centre,graph:STREETS.graph} : null;
+}
+function newMission(st,rng){
+  var m=pickMission(rng,st,roadsCtx()); if(!m) return;
+  st.mission=m; st.mission.progress=0;
+  var body=m.type==='FOLLOW'
+    ? 'Stay within 25 metres of '+((st.players[m.targetId]||{}).name||'them')+' for 30 seconds.\nREWARD: their area is secretly sent to the seekers.'
+    : 'Reach the purple marker and stay there for 15 seconds.\nREWARD: you earn a secret tip to send.';
+  pushEvent(st,st.imposterId,'mission','SECRET MISSION',body);
+}
+function spawnObjectives(st,rng){
+  st.objectives=(st.objectives||[]).filter(function(o){return !o.claimedBy;});
+  var roads=roadsCtx();
+  while(st.objectives.length<2){
+    var c=reachableSpot(rng,st.zone,st.zone.r*0.85,roads);
+    st.objectives.push({id:uid(),lat:c.lat,lng:c.lng,type:rng()<0.5?'JAMMER':'INTEL',prog:{}});
+  }
+}
+function resolveTribunal(st){
+  var tb=st.tribunal; if(!tb||tb.done) return; tb.done=true;
+  // quorum is measured against the phones still answering, not against players who
+  // dropped an hour ago — otherwise every vote resolves as "no decision".
+  var voters=presentVoters(st.players,now());
+  if(!voters.length) voters=eligibleVoters(st.players);
+  var res=resolveVote(tb.votes,voters);
+  var con=voteConsequence(res,st.imposterId,st.imposterEligible);
+  st.tribunalsDone++;
+  Object.keys(tb.votes).forEach(function(v){
+    var tgt=tb.votes[v]; if(tgt&&tgt!=='skip'&&st.players[tgt]) st.players[tgt].stats.votes++;
+  });
+  if(con.kind==='skip'){
+    pushEvent(st,'all','novote','NO DECISION','Nobody was accused. The imposter is still out there.');
+  } else if(con.kind==='correct'){
+    st.imposterEligible=false; st.imposterPower=false; st.mission=null;
+    pushEvent(st,'all','found','IMPOSTER FOUND',(st.players[con.target].name)+' was the imposter. Their powers are gone — but they are still in the game as a hider.');
+  } else {
+    var dur=CFG.fullSignal[tb.which]||60;
+    st.fullSignalUntil=now()+dur*1000;
+    pushEvent(st,'all','fullsignal','WRONG',(st.players[con.target]?st.players[con.target].name:'They')+' was innocent. The imposter is still among you.\n\nFULL SIGNAL: every hider is visible to the seekers for '+dur+' seconds. RUN!');
+  }
+  st.tribunal.result=con.kind;
+}
+function endMatch(st,w){
+  w=w||checkWin(st,(now()-st.t0)/1000)||{winner:'seekers'};
+  st.phase='RESULTS'; st.winner=w.winner; st.endedAt=now(); st.fullSignalUntil=0;
+  pushEvent(st,'all','end','END',w.winner);
+}
+
+/* ---------- actions (client → host) ---------- */
+function act(type,data){
+  G.seq++;
+  var a={seq:G.seq,type:type,data:data,t:now()};
+  if(G.isHost) applyAction(G.st,G.me.id,a);
+  else {
+    // held until the host acknowledges the seq — dropping an unacked catch or vote
+    // on the floor is how a tap silently does nothing.
+    G.outbox.push(a);
+    if(G.outbox.length>32) G.outbox.shift();
+    G.flush=true;
+  }
+}
+function applyAction(st,pid,a){
+  var p=st.players[pid]; if(!p) return;
+  if(a.type==='catch'){
+    var tgt=st.players[a.data];
+    if(tgt&&canCatch(p,tgt,now())){
+      tgt.caught=true; tgt.convertAt=now()+CFG.conversion*1000; tgt.outsideSince=null;
+      p.stats.catches++;
+      pushEvent(st,'all','caught','HIDER CAUGHT',tgt.name+' has been caught by '+p.name+'.');
+      pushEvent(st,tgt.id,'you-caught','CAUGHT!',"You're joining the hunt.");
+      var w=checkWin(st); if(w) endMatch(st,w);
+    }
+  }
+  if(a.type==='vote'&&st.tribunal&&!st.tribunal.done){
+    if(eligibleVoters(st.players).indexOf(pid)>=0) st.tribunal.votes[pid]=a.data;
+  }
+  if(a.type==='tip'&&pid===st.imposterId&&st.tips>0&&st.imposterEligible){
+    st.tips--;
+    var body=a.data==='near'?'A hider was active around this area.'
+      :a.data==='target'?'Strong signal detected here.':'Movement reported near an objective.';
+    var at=null;
+    if(a.data==='near'&&p.lat!=null) at={lat:p.lat,lng:p.lng,r:60};
+    if(a.data==='target'&&st.mission&&st.mission.targetId&&st.players[st.mission.targetId]){
+      var t2=st.players[st.mission.targetId]; if(t2.lat!=null) at={lat:t2.lat,lng:t2.lng,r:50};
+    }
+    if(!at&&st.objectives&&st.objectives[0]) at={lat:st.objectives[0].lat,lng:st.objectives[0].lng,r:70};
+    if(at){ st.blips.push({lat:at.lat,lng:at.lng,r:at.r,until:now()+60000,src:'tip',leak:true}); p.stats.leaks++; }
+    pushEvent(st,'seekers','tip','SECRET TIP',body);
+    pushEvent(st,pid,'tipsent','TIP SENT','The seekers have no idea it came from you.');
+  }
+  if(a.type==='start'&&pid===st.hostId&&st.phase==='LOBBY') startMatch(st);
+}
+
+function startMatch(st){
+  var ids=Object.keys(st.players);
+  if(ids.length<2){ toast('Need at least 2 players'); return; }
+  var r=assignRoles(ids,mulberry32(st.seed),st.cfg.imposters);
+  ids.forEach(function(id){ st.players[id].role=r.roles[id]; });
+  st.imposterId=r.imposterId; st.imposterEligible=!!r.imposterId;
+  st.phase='SCATTER'; st.t0=now(); st._last=now();
+  pushEvent(st,'all','scatter','THE SCATTER','Hiders: go. Seeker: wait.');
+}
+
+/* ---------- bots (solo testing) ---------- */
+function addBot(st){
+  var id='bot_'+uid(), used={};
+  Object.keys(st.players).forEach(function(k){used[st.players[k].char]=1;});
+  var ch=0; for(var i=0;i<CHARS.length;i++){ if(!used[i]){ch=i;break;} }
+  var names=['Sarah','Jack','Maya','Theo','Nia','Otto','Pia','Rex','Sam','Wren'];
+  var nm=names[Object.keys(st.players).length%names.length];
+  var p=newPlayer(id,nm,ch,false); p.bot=true;
+  var c=reachableSpot(Math.random,st.zone,st.zone.r*0.6,roadsCtx());
+  p.lat=c.lat;p.lng=c.lng;p.locT=now();
+  st.players[id]=p; G.bots.push(id);
+  return p;
+}
+function botTick(st,dt,n){
+  // bots cast a vote once per tribunal
+  if(st.tribunal&&!st.tribunal.done){
+    var elig=eligibleVoters(st.players);
+    G.bots.forEach(function(id){
+      if(elig.indexOf(id)<0||st.tribunal.votes[id]) return;
+      if(Math.random()<0.35){ st.tribunal.votes[id]='skip'; return; }
+      var pick=elig.filter(function(x){return x!==id;});
+      if(pick.length) st.tribunal.votes[id]=pick[Math.floor(Math.random()*pick.length)];
+    });
+  }
+  G.bots.forEach(function(id){
+    var p=st.players[id]; if(!p) return;
+    if(p.caught){ p.locT=n; return; }
+    var vx=0,vy=0,speed=p.role==='seeker'?2.0:1.6;
+    if(p.role==='seeker'){
+      var best=null,bd=1e9;
+      (st.blips||[]).forEach(function(b){ var d=metersBetween(p,b); if(d<bd){bd=d;best=b;} });
+      Object.keys(st.players).forEach(function(x){
+        var q=st.players[x]; if(q.role==='seeker'||q.caught||q.lat==null) return;
+        var d=metersBetween(p,q); if(d<60&&d<bd){bd=d;best=q;}
+      });
+      if(best){ var dd=dirTo(p,best); vx=dd.x;vy=dd.y; }
+      else { vx=Math.cos(n/4000+id.length);vy=Math.sin(n/5000+id.length); }
+      // bot catches
+      Object.keys(st.players).forEach(function(x){
+        var q=st.players[x];
+        if(canCatch(p,q,n)) applyAction(st,id,{type:'catch',data:x});
+      });
+    } else {
+      var threat=null,td=1e9;
+      Object.keys(st.players).forEach(function(x){
+        var q=st.players[x]; if(q.role!=='seeker'||q.lat==null) return;
+        var d=metersBetween(p,q); if(d<td){td=d;threat=q;}
+      });
+      if(threat&&td<120){ var t2=dirTo(p,threat); vx=-t2.x;vy=-t2.y; speed=1.9; }
+      else { var zc=dirTo(p,st.zone); var dz=metersBetween(p,st.zone);
+        if(dz>st.zone.r*0.75){vx=zc.x;vy=zc.y;}
+        else {vx=Math.cos(n/6000+p.name.length);vy=Math.sin(n/7000+p.name.length);} }
+    }
+    var len=Math.sqrt(vx*vx+vy*vy)||1; vx/=len; vy/=len;
+    var np=offsetLatLng(p,vx*speed*dt,vy*speed*dt);
+    // stick to the street network where we have one — a bot cutting straight through
+    // a terrace block reads as a bug long before anyone reads it as a shortcut
+    var roads=roadsCtx();
+    if(roads){
+      var l=localFrom(roads.centre,np);
+      var f=followRoad(roads.graph,l.x,l.y,vx,vy,0.35);
+      if(f.on) np=offsetLatLng(roads.centre,f.x,f.y);
+    }
+    p.stats.dist+=speed*dt;
+    p.lat=np.lat;p.lng=np.lng;p.locT=n;
+  });
+}
+function dirTo(a,b){
+  var e=metersBetween({lat:a.lat,lng:a.lng},{lat:a.lat,lng:b.lng})*(b.lng>a.lng?1:-1);
+  var nn=metersBetween({lat:a.lat,lng:a.lng},{lat:b.lat,lng:a.lng})*(b.lat>a.lat?1:-1);
+  var l=Math.sqrt(e*e+nn*nn)||1; return {x:e/l,y:nn/l};
+}
+
+/* ---------- networking ---------- */
+function pushInput(){
+  if(G.mode!=='net'||G.isHost||!G.code) return Promise.resolve();
+  var pending=pendingActions(G.outbox,G.ack);
+  var p={id:G.me.id,name:G.me.name,char:G.me.char,seq:G.seq,
+    lat:G.pos?G.pos.lat:null,lng:G.pos?G.pos.lng:null,locT:G.pos?G.pos.t:0,acc:G.pos?G.pos.acc:null,
+    actions:pending.slice(-24),ts:now()};
+  return netPutInput(G.code,G.me.id,p);
+}
+function pullInputs(){
+  if(!G.isHost||G.mode!=='net') return Promise.resolve();
+  return netListInputs(G.code).then(function(list){
+    var st=G.st,n=now(); if(!st) return;
+    (list||[]).forEach(function(inp){
+      if(!inp||!inp.id||inp.id===G.me.id) return;
+      var p=st.players[inp.id];
+      if(!p){
+        // late arrivals may only take a seat while the lobby is open; a player who
+        // already has one is reconnecting and is always let back in.
+        if(st.phase!=='LOBBY') return;
+        if(Object.keys(st.players).length>=12) return;
+        // a row left behind by someone who walked away must not re-seat them every
+        // time it is read back — only a genuinely newer push counts as a return
+        if((inp.ts||0)<=(G.dropped[inp.id]||0)) return;
+        p=newPlayer(inp.id,inp.name,inp.char,false); st.players[inp.id]=p;
+        delete G.dropped[inp.id];
+        pushEvent(st,'all','join','PLAYER JOINED',(inp.name||'Someone')+' is in the lobby.');
+      }
+      mergePlayerInput(p,inp,n);
+      newActions(inp.actions,G.lastSeq[inp.id]).forEach(function(a){
+        G.lastSeq[inp.id]=a.seq; applyAction(st,inp.id,a);
+      });
+      st.ack=st.ack||{}; st.ack[inp.id]=G.lastSeq[inp.id]||0;
+    });
+    // Someone who backs out of the lobby leaves their last input row behind. In the
+    // lobby that seat is free to reclaim, so drop them rather than start a match
+    // waiting on a phone that went home. Once the match is running nobody is removed.
+    if(st.phase==='LOBBY'){
+      Object.keys(st.players).forEach(function(id){
+        if(id===G.me.id||st.players[id].bot) return;
+        if(presence(st.players[id],n)==='lost'){
+          pushEvent(st,'all','left','PLAYER LEFT',st.players[id].name+' left the lobby.');
+          G.dropped[id]=st.players[id].inputTs||0;
+          delete st.players[id]; delete G.lastSeq[id];
+          if(st.ack) delete st.ack[id];
+        }
+      });
+    }
+  });
+}
+function pushState(){
+  if(!G.isHost||G.mode!=='net'||!G.st) return Promise.resolve();
+  G.st.ver++; G.st.hostAt=now();
+  return netPutState(G.code,G.st);
+}
+function pullState(){
+  if(G.isHost||G.mode!=='net') return Promise.resolve();
+  return netGetState(G.code).then(function(s){
+    if(!s||!s.code) return;
+    if(G.st&&s.ver<G.st.ver) return;           // an out-of-order read; keep what we have
+    G.st=s; applyCfg(s.cfg); G.lastGoodPull=now();
+    G.ack=(s.ack&&s.ack[G.me.id])||0;
+    G.outbox=pendingActions(G.outbox,G.ack);
+  });
+}
+function netFail(e){ if(e&&e.message&&/no transport/.test(e.message)) G.mode='solo'; }
+/* A client that cannot see the host is not "fine but quiet" — say so on screen. */
+function netStatus(){
+  if(G.mode!=='net') return {s:'ok',t:'Solo'};
+  if(NET.kind==='none') return {s:'bad',t:'No transport'};
+  var since=now()-(G.isHost?NET.lastOkAt:G.lastGoodPull);
+  if(!NET.lastOkAt&&!G.lastGoodPull) return {s:'warn',t:'Connecting…'};
+  if(since>15000) return {s:'bad',t:'Offline'};
+  if(!G.isHost&&G.st&&G.st.hostAt&&!hostAlive(G.st,now())) return {s:'bad',t:'Host quiet'};
+  if(since>6000) return {s:'warn',t:'Slow'};
+  return {s:'ok',t:'Synced'};
+}
+
+function netLoop(){
+  var n=now(), iv=G.isHost?CFG.syncHost:CFG.syncClient;
+  if(G.mode==='net'&&G.code&&G.st&&!G.netBusy&&(G.flush||n-G.lastPush>=iv)){
+    G.lastPush=n; G.flush=false; G.netBusy=true;
+    var job=G.isHost?pullInputs().then(pushState):pushInput().then(pullState);
+    job.catch(netFail).then(function(){G.netBusy=false;},function(){G.netBusy=false;});
+  }
+  setTimeout(netLoop,250);
+}
+
+/* ---------- location ---------- */
+var GPSF=null;
+function startGPS(){
+  if(!navigator.geolocation){ G.gps='virtual'; return; }
+  GPSF=makeGpsFilter();
+  try{ if(navigator.wakeLock) navigator.wakeLock.request('screen').catch(function(){}); }catch(e){}
+  try{
+    navigator.geolocation.watchPosition(function(pos){
+      var raw={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy,t:now()};
+      G.rawAcc=pos.coords.accuracy;
+      var f=GPSF.push(raw)||raw;
+      G.gps=gpsQuality(f.acc).level<=1?'weak':'ok';
+      G.pos={lat:f.lat,lng:f.lng,acc:f.acc,t:now()};
+      if(G.isHost&&G.st&&G.st.players[G.me.id]){
+        var p=G.st.players[G.me.id];
+        if(p.lat!=null) p.stats.dist+=metersBetween(p,G.pos);
+        p.lat=G.pos.lat;p.lng=G.pos.lng;p.locT=G.pos.t;p.acc=G.pos.acc;
+      }
+    },function(err){
+      if(G.gps!=='ok'){ G.gps='denied';
+        GPSERR=err&&err.code===1?'Permission denied — allow location for this site, then reopen.'
+          :err&&err.code===2?'No position available. GPS may be off, or you are deep indoors.'
+          :'Timed out waiting for a fix.'; }
+    },
+    {enableHighAccuracy:true,maximumAge:0,timeout:20000});
+  }catch(e){ G.gps='virtual'; }
+}
+var DEFAULT_CENTRE={lat:-33.8688,lng:151.2093};
+function virtualStart(centre){
+  G.gps='virtual';
+  G.pos={lat:centre.lat,lng:centre.lng,acc:5,t:now()};
+  G.simMove=true;
+}
+function pushLocalPos(){
+  if(!G.st) return; var p=G.st.players[G.me.id]; if(!p) return;
+  if(!G.isHost) return;
+  p.online=now();                                   // the host is never "dropped"
+  if(!G.pos) return;
+  if(p.lat!=null) p.stats.dist+=metersBetween(p,G.pos);
+  p.lat=G.pos.lat;p.lng=G.pos.lng;p.locT=G.pos.t;p.acc=G.pos.acc;
+}
+
+/* ============================================================
+   PART 4 — map rendering
+   ============================================================ */
+var cv,ctx,DPR=1,VW=0,VH=0;
+var TILES={on:true,cache:{},fails:0};
+function initMap(){
+  cv=$('#map'); ctx=cv.getContext('2d');
+  resizeMap(); window.addEventListener('resize',resizeMap);
+  // drag to move (virtual GPS / dev)
+  var drag=null;
+  cv.addEventListener('touchstart',function(e){ if(!G.simMove)return; drag={x:e.touches[0].clientX,y:e.touches[0].clientY}; },{passive:true});
+  cv.addEventListener('touchmove',function(e){
+    if(!G.simMove||!drag)return;
+    var dx=e.touches[0].clientX-drag.x, dy=e.touches[0].clientY-drag.y;
+    drag={x:e.touches[0].clientX,y:e.touches[0].clientY};
+    var m=G.view.mpp;
+    G.pos=offsetLatLng(G.pos||G.st.zone,-dx*m,dy*m); G.pos.t=now(); G.pos.acc=5;
+    pushLocalPos();
+  },{passive:true});
+  cv.addEventListener('touchend',function(){drag=null;});
+  cv.addEventListener('mousedown',function(e){ if(!G.simMove)return; drag={x:e.clientX,y:e.clientY}; });
+  window.addEventListener('mousemove',function(e){
+    if(!G.simMove||!drag)return;
+    var dx=e.clientX-drag.x,dy=e.clientY-drag.y; drag={x:e.clientX,y:e.clientY};
+    var m=G.view.mpp; G.pos=offsetLatLng(G.pos||G.st.zone,-dx*m,dy*m); G.pos.t=now(); G.pos.acc=5; pushLocalPos();
+  });
+  window.addEventListener('mouseup',function(){drag=null;});
+}
+function resizeMap(){
+  if(!cv) return;
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  VW=cv.clientWidth||window.innerWidth; VH=cv.clientHeight||window.innerHeight;
+  cv.width=Math.floor(VW*DPR); cv.height=Math.floor(VH*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0); ctx.imageSmoothingEnabled=false;
+}
+function toScreen(p){
+  var c=G.view;
+  var e=metersBetween({lat:c.lat,lng:c.lng},{lat:c.lat,lng:p.lng})*(p.lng>c.lng?1:-1);
+  var n=metersBetween({lat:c.lat,lng:c.lng},{lat:p.lat,lng:c.lng})*(p.lat>c.lat?1:-1);
+  return {x:VW/2+e/c.mpp, y:VH/2-n/c.mpp};
+}
+function lerpZone(st){
+  if(!st.closing||!st.next) return st.zone;
+  var k=clamp((now()-st.closing.at)/(CFG.zoneClose*1000),0,1);
+  var f=st.closing.from,t=st.next;
+  return {lat:f.lat+(t.lat-f.lat)*k, lng:f.lng+(t.lng-f.lng)*k, r:f.r+(t.r-f.r)*k};
+}
+function hash2(i,j,s){var x=Math.sin(i*127.1+j*311.7+s)*43758.5453;return x-Math.floor(x);}
+function drawTerrain(z){
+  if(drawStreets()) return;
+  if(drawTiles()) return;
+  var C=70; // block size metres
+  var span=Math.max(VW,VH)*G.view.mpp;
+  while((span/C)*(span/C)>420) C*=2;
+  ctx.fillStyle='#171a26'; ctx.fillRect(0,0,VW,VH);
+  var seed=Math.floor(Math.abs(z.lat*1000))%997;
+  var half=Math.max(VW,VH)*G.view.mpp/2+C*2;
+  var oe=metersBetween({lat:z.lat,lng:z.lng},{lat:z.lat,lng:G.view.lng})*(G.view.lng>z.lng?1:-1);
+  var on=metersBetween({lat:z.lat,lng:z.lng},{lat:G.view.lat,lng:z.lng})*(G.view.lat>z.lat?1:-1);
+  var i0=Math.floor((oe-half)/C), i1=Math.ceil((oe+half)/C);
+  var j0=Math.floor((on-half)/C), j1=Math.ceil((on+half)/C);
+  var road='#2b3040';
+  for(var i=i0;i<=i1;i++) for(var j=j0;j<=j1;j++){
+    var h=hash2(i,j,seed);
+    var col=h<0.16?'#25412c':h<0.24?'#1d3346':h<0.62?'#20242f':'#242836';
+    var p=offsetLatLng(z,i*C,j*C), s=toScreen(p);
+    var px=C/G.view.mpp;
+    ctx.fillStyle=col; ctx.fillRect(Math.floor(s.x),Math.floor(s.y-px),Math.ceil(px),Math.ceil(px));
+    // building blobs
+    if(h>=0.24&&px>14){
+      var n2=2+Math.floor(hash2(i,j,seed+7)*3);
+      for(var k=0;k<n2;k++){
+        var bx=hash2(i+k,j,seed+3),by=hash2(i,j+k,seed+5),bw=0.18+hash2(i+k,j+k,seed+9)*0.28;
+        ctx.fillStyle=k%2?'#2c3143':'#333850';
+        ctx.fillRect(Math.floor(s.x+bx*px*0.7)+2,Math.floor(s.y-px+by*px*0.7)+2,Math.max(3,px*bw),Math.max(3,px*bw));
+      }
+    }
+    // roads on cell edges
+    ctx.fillStyle=road;
+    ctx.fillRect(Math.floor(s.x)-Math.max(2,px*0.07),Math.floor(s.y-px),Math.max(3,px*0.14),Math.ceil(px)+2);
+    ctx.fillRect(Math.floor(s.x),Math.floor(s.y)-Math.max(2,px*0.07),Math.ceil(px)+2,Math.max(3,px*0.14));
+  }
+}
+function drawZone(z,st){
+  var c=toScreen(z), r=z.r/G.view.mpp;
+  // darken outside
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0,0,VW,VH);
+  ctx.arc(c.x,c.y,r,0,6.2832,true); ctx.closePath();
+  ctx.fillStyle='rgba(10,7,18,0.55)'; ctx.fill();
+  ctx.restore();
+  var pulse=st.closing?(0.5+0.5*Math.sin(now()/180)):(0.55+0.45*Math.sin(now()/700));
+  ctx.lineWidth=4; ctx.strokeStyle=st.closing?'rgba(242,166,59,'+pulse+')':'rgba(67,176,232,'+pulse+')';
+  ctx.beginPath(); ctx.arc(c.x,c.y,r,0,6.2832); ctx.stroke();
+  if(st.next){
+    var n=toScreen(st.next), nr=st.next.r/G.view.mpp;
+    ctx.setLineDash([8,8]); ctx.lineWidth=3; ctx.strokeStyle='rgba(242,166,59,0.9)';
+    ctx.beginPath(); ctx.arc(n.x,n.y,nr,0,6.2832); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='rgba(242,166,59,0.08)'; ctx.fill();
+  }
+}
+function drawBlips(st){
+  var n=now();
+  (st.blips||[]).forEach(function(b){
+    var s=toScreen(b), r=Math.max(10,b.r/G.view.mpp);
+    var k=clamp((b.until-n)/8000,0,1);
+    var pulse=0.35+0.3*Math.sin(n/300);
+    ctx.fillStyle='rgba(232,80,58,'+(0.12*k+0.05)+')';
+    ctx.beginPath(); ctx.arc(s.x,s.y,r,0,6.2832); ctx.fill();
+    ctx.strokeStyle=b.leak?'rgba(160,92,224,'+(0.9*k)+')':'rgba(232,80,58,'+(pulse*k+0.2)+')';
+    ctx.lineWidth=2; ctx.beginPath(); ctx.arc(s.x,s.y,r,0,6.2832); ctx.stroke();
+    ctx.fillStyle=b.leak?'#a05ce0':'#e8503a';
+    ctx.fillRect(s.x-3,s.y-3,6,6);
+  });
+}
+function drawObjectives(st){
+  var mine=me(); if(!mine||mine.role==='seeker') return;
+  (st.objectives||[]).forEach(function(o){
+    if(o.claimedBy) return;
+    var s=toScreen(o), S=3, bob=Math.sin(now()/300)*3;
+    ctx.fillStyle=o.type==='JAMMER'?'#63c77c':'#43b0e8';
+    ctx.fillRect(s.x-5*S/2,s.y-14+bob,5*S,5*S);
+    ctx.fillStyle='#0b0916'; ctx.fillRect(s.x-S,s.y-11+bob,2*S,2*S);
+    ctx.fillStyle='rgba(255,255,255,.12)';
+    ctx.beginPath();ctx.arc(s.x,s.y,CFG.objectiveRadius/G.view.mpp,0,6.2832);ctx.fill();
+    label(s.x,s.y+14+bob,o.type==='JAMMER'?'JAMMER':'INTEL','#cfc7e0',8);
+  });
+  if(st.mission&&st.mission.type==='LURE'&&G.me.id===st.imposterId){
+    var s2=toScreen(st.mission);
+    ctx.fillStyle='#a05ce0'; ctx.fillRect(s2.x-6,s2.y-6,12,12);
+    ctx.strokeStyle='rgba(160,92,224,.6)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(s2.x,s2.y,CFG.objectiveRadius/G.view.mpp,0,6.2832);ctx.stroke();
+    label(s2.x,s2.y+18,'SECRET SPOT','#d3b6f5',8);
+  }
+}
+function label(x,y,txt,col,size){
+  ctx.font='900 '+(size||9)+'px Helvetica,Arial,sans-serif';
+  ctx.textAlign='center';
+  ctx.fillStyle='rgba(11,9,22,.75)';
+  var w=ctx.measureText(txt).width+8;
+  ctx.fillRect(x-w/2,y-(size||9)-2,w,(size||9)+6);
+  ctx.fillStyle=col||'#f2ecdf'; ctx.fillText(txt,x,y+1);
+}
+function visibleTo(mine,p,st){
+  if(p.id===G.me.id) return true;
+  var n=now();
+  if(mine.role==='seeker'){
+    if(p.role==='seeker') return true;                       // seekers coordinate
+    if(p.caught) return true;                                // just-caught players
+    if(n<st.fullSignalUntil) return true;                    // FULL SIGNAL
+    if(n<(p.liveUntil||0)) return true;                      // long-term zone violation
+    return false;
+  }
+  return false;                                              // hiders/imposter see nobody
+}
+function drawPlayers(st){
+  var mine=me(); if(!mine) return;
+  var ids=Object.keys(st.players);
+  ids.sort(function(a,b){return (st.players[a].lat||0)>(st.players[b].lat||0)?-1:1;});
+  ids.forEach(function(id){
+    var p=st.players[id]; if(p.lat==null) return;
+    if(!visibleTo(mine,p,st)) return;
+    var tp=(id===G.me.id&&G.pos)?G.pos:p;
+    var r=G.render[id]||(G.render[id]={lat:tp.lat,lng:tp.lng,dir:'S',frame:0,ft:0,moving:false});
+    var moved=metersBetween(r,tp);
+    r.lat+=(tp.lat-r.lat)*0.16; r.lng+=(tp.lng-r.lng)*0.16;
+    if(moved>0.6){
+      r.moving=true; r.mt=now();
+      var d=dirTo(r,tp);
+      r.dir=Math.abs(d.x)>Math.abs(d.y)?(d.x>0?'E':'W'):(d.y>0?'N':'S');
+    } else if(now()-(r.mt||0)>600) r.moving=false;
+    r.ft+=r.moving?0.22:0.06;
+    var frame=Math.floor(r.ft)%2;
+    var s=toScreen(r);
+    var S=clamp(Math.round(2.4/Math.max(0.6,G.view.mpp)*2),2,5);
+    // shadow
+    ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(s.x-4*S/2,s.y-2,4*S,2*S/2);
+    var alpha=p.caught?0.5:1;
+    drawChar(ctx,p.char,r.dir,r.moving?frame:0,S,s.x-7*S,s.y-18*S,alpha);
+    var col=p.id===G.me.id?'#43b0e8':(p.role==='seeker'?'#f2a63b':'#f2ecdf');
+    label(s.x,s.y-19*S,p.name.toUpperCase(),col,9);
+    if(p.caught) label(s.x,s.y+10,'CAUGHT','#e8503a',8);
+  });
+  // accuracy ring for self
+  if(G.pos&&G.pos.acc>25){
+    var sp=toScreen(G.pos);
+    ctx.strokeStyle='rgba(67,176,232,.25)';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(sp.x,sp.y,G.pos.acc/G.view.mpp,0,6.2832);ctx.stroke();
+  }
+}
+function renderMap(){
+  if(!ctx||!G.st) return;
+  var st=G.st, z=lerpZone(st);
+  var c=G.pos||{lat:z.lat,lng:z.lng};
+  G.view.lat+=(c.lat-G.view.lat)*0.2; G.view.lng+=(c.lng-G.view.lng)*0.2;
+  if(!isFinite(G.view.lat)||G.view.lat===0){G.view.lat=c.lat;G.view.lng=c.lng;}
+  var minDim=Math.min(VW,VH);
+  var want=clamp((z.r*2)/(minDim*0.8),0.35,3.2);
+  G.view.mpp+=(want-G.view.mpp)*0.05;
+  drawTerrain(z);
+  drawZone(z,st);
+  drawObjectives(st);
+  if(isSeeker()) drawBlips(st);
+  drawPlayers(st);
+  // full signal wash
+  if(now()<st.fullSignalUntil){
+    ctx.fillStyle='rgba(232,80,58,'+(0.05+0.04*Math.sin(now()/200))+')';
+    ctx.fillRect(0,0,VW,VH);
+  }
+}
+
+/* ============================================================
+   PART 5 — screens, HUD, alerts, dev tools, boot
+   ============================================================ */
+var CUR='s-welcome';
+function show(id){
+  $$('.screen').forEach(function(s){s.classList.remove('active');});
+  var el=document.getElementById(id); if(el){el.classList.add('active');el.scrollTop=0;}
+  CUR=id;
+}
+function mood(m){
+  document.body.className='mood-'+m+((m==='danger'||m==='caught')?' pulse':'');
+}
+function toast(msg){ showAlert('',msg,'',null,1400); }
+
+/* ---------- alert queue ---------- */
+var AQ=[],aBusy=false;
+function showAlert(title,body,sub,fx,ms){
+  AQ.push({title:title,body:body,sub:sub,fx:fx,ms:ms||2600}); pumpAlerts();
+}
+function pumpAlerts(){
+  if(aBusy||!AQ.length) return;
+  var a=AQ.shift(); aBusy=true;
+  var box=$('#alert');
+  $('#alertTitle').textContent=a.title||'';
+  $('#alertSub').textContent=a.sub||'';
+  $('#alertBody').textContent=a.body||'';
+  box.className='show'+(a.fx==='glitch'?' glitch':'');
+  setTimeout(function(){ box.className=''; aBusy=false; setTimeout(pumpAlerts,180); },a.ms);
+}
+function drainEvents(){
+  if(!G.st) return;
+  (G.st.events||[]).forEach(function(ev){
+    if(ev.id<=G.seenEvent) return;
+    G.seenEvent=ev.id;
+    if(!eventForMe(ev)) return;
+    if(ev.kind==='end') return;
+    var fx=null;
+    if(ev.kind==='fullsignal'){fx='glitch';mood('danger');SFX.glitch();buzz([80,60,80,60,160]);}
+    else if(ev.kind==='you-caught'){SFX.caught();buzz(300);mood('caught');}
+    else if(ev.kind==='caught'||ev.kind==='newseeker'){SFX.bad();}
+    else if(ev.kind==='zone'){SFX.alarm();buzz(60);mood('zone');}
+    else if(ev.kind==='mission'||ev.kind==='tip'||ev.kind==='tipsent'){SFX.ok();buzz(40);}
+    else if(ev.kind==='found'){SFX.reveal();}
+    else SFX.ok();
+    showAlert(ev.title,ev.body,ev.sub||'',fx,ev.kind==='fullsignal'?4200:2600);
+  });
+}
+
+/* ---------- profile ---------- */
+function saveProfile(){
+  // the id has to survive a reload, or a phone that locks itself mid-match comes
+  // back as a stranger and can never rejoin the room it is already in
+  try{ if(window.storage) window.storage.set('fs:profile',
+    JSON.stringify({name:G.me.name,char:G.me.char,id:G.me.id,mp:G.mp}),false); }catch(e){}
+}
+function loadProfile(){
+  if(!window.storage) return Promise.resolve(null);
+  return window.storage.get('fs:profile',false).then(function(r){return r?JSON.parse(r.value):null;}).catch(function(){return null;});
+}
+
+/* ---------- character picker ---------- */
+function buildCharGrid(){
+  var g=$('#charGrid'); g.innerHTML='';
+  CHARS.forEach(function(c,i){
+    var d=document.createElement('div'); d.className='charcell'+(i===G.me.char?' on':'');
+    var cvs=document.createElement('canvas'); cvs.width=42;cvs.height=54;
+    d.appendChild(cvs); var sp=document.createElement('span'); sp.textContent=c.n; d.appendChild(sp);
+    d.onclick=function(){ G.me.char=i; SFX.tap(); buildCharGrid(); paintChar($('#charBig'),i,'S',0); };
+    g.appendChild(d); paintChar(cvs,i,'S',0);
+  });
+}
+
+/* ---------- multiplayer setup ---------- */
+function renderMpScreen(){
+  var sql=$('#mpSql'); if(sql) sql.textContent=MP_SQL;
+  if($('#mpUrl')&&G.mp){ $('#mpUrl').value=G.mp.url||''; $('#mpKey').value=G.mp.key||''; }
+  var s=$('#mpStatus'); if(!s) return;
+  netRefresh();
+  s.textContent=NET.kind==='supabase'
+    ? 'Connected through '+G.mp.url+'. Rooms you create can be joined from any phone.'
+    : NET.kind==='storage'
+      ? 'Using the host page’s storage bridge. That only works for people opening this exact page inside the same host — add a Supabase project for real phone-to-phone play.'
+      : 'No connection. Create game will only offer solo play until this is filled in.';
+}
+function saveMp(){
+  var url=($('#mpUrl').value||'').trim(), key=($('#mpKey').value||'').trim();
+  var msg=$('#mpMsg');
+  var mp={url:url.replace(/\/+$/,''),key:key};
+  if(!validMp(mp)){
+    msg.textContent='That does not look right — the URL must start with https:// and the anon key is a long token.';
+    SFX.bad(); return;
+  }
+  G.mp=mp; netRefresh();
+  msg.textContent='Testing…';
+  netTest().then(function(){
+    msg.style.color='var(--moss)';
+    msg.textContent='Connected. Rooms will work on any phone from here.';
+    saveProfile(); SFX.ok(); renderMpScreen();
+  }).catch(function(e){
+    msg.style.color='var(--ember)';
+    msg.textContent=(e&&e.message)||'Could not reach the project.';
+    SFX.bad(); renderMpScreen();
+  });
+}
+
+/* ---------- lobby ---------- */
+function presenceLabel(p,st){
+  if(p.bot) return 'bot';
+  if(p.host) return 'host';
+  var pr=presence(p,now());
+  return pr==='live'?'ready':pr==='stale'?'signal weak':'signal lost';
+}
+function renderLobby(){
+  var st=G.st; if(!st) return;
+  $('#lobbyCode').textContent=st.code&&G.mode==='net'?st.code:'SOLO';
+  var ids=Object.keys(st.players);
+  $('#lobbyCount').textContent=ids.length+(ids.length===1?' player':' players');
+  var g=$('#lobbyRoster'); g.innerHTML='';
+  ids.forEach(function(id){
+    var p=st.players[id], pr=p.bot?'live':presence(p,now());
+    var d=document.createElement('div');
+    d.className='rcell'+(p.host?' host':'')+(pr==='stale'?' stale':pr==='lost'?' lost':'');
+    var c=document.createElement('canvas'); c.width=40;c.height=52; d.appendChild(c);
+    var b=document.createElement('b'); b.textContent=p.name; d.appendChild(b);
+    var i=document.createElement('i'); i.textContent=presenceLabel(p,st); d.appendChild(i);
+    g.appendChild(d); paintChar(c,p.char,'S',(Math.floor(now()/500)+id.length)%2);
+  });
+  var lp=$('#lobbyLinkPanel'), ll=$('#lobbyLink');
+  if(lp){
+    var showLink=G.mode==='net'&&G.isHost&&G.joinLink;
+    lp.classList.toggle('hidden',!showLink);
+    if(showLink&&ll) ll.textContent=G.joinLink;
+  }
+  $('#b-start').classList.toggle('hidden',!G.isHost);
+  var lr=$('#lobbyRules'); if(lr&&st.cfg) lr.textContent=rulesSummary(st.cfg);
+  $('#lobbyHint').textContent=G.isHost
+    ? (ids.length<3?'You need at least 3 players for an imposter. Add bots from the DEV tab to test alone.':'Everyone in? Start when ready.')
+    : 'Waiting for the host to start…';
+  var ln=$('#lobbyNet');
+  if(ln){
+    var ns=netStatus();
+    ln.textContent=G.mode==='solo'?'Solo game — nothing is being sent anywhere.'
+      :(G.isHost?'Room published via '+netLabel()+' · '+ns.t
+                :'Connected to the host via '+netLabel()+' · '+ns.t)+
+       (ns.s==='bad'&&NET.lastErr?' ('+NET.lastErr+')':'');
+  }
+}
+
+/* ---------- role reveal ---------- */
+var roleShown=false;
+function doRoleReveal(){
+  if(roleShown) return;
+  var p=me(); if(!p) return; roleShown=true;
+  show('s-role'); paintChar($('#roleChar'),p.char,'S',0);
+  $('#roleTitle').style.opacity=0; $('#roleBody').style.opacity=0;
+  $('#b-role-ok').classList.add('hidden');
+  SFX.reveal();
+  setTimeout(function(){
+    var t=$('#roleTitle'),b=$('#roleBody');
+    if(p.role==='seeker'){ mood('seeker'); t.textContent='You are the seeker';
+      b.innerHTML='<p>Give them a head start.</p><p>Then hunt them down. Everyone you catch joins your team.</p>'; }
+    else if(p.role==='imposter'){ mood('imposter'); t.textContent='You are the imposter';
+      b.innerHTML="<p>They think you're one of them.</p><p>Secretly help hiders get caught. Don't get discovered — and don't get caught.</p><p><b>Be the last hider standing.</b></p>"; }
+    else { mood('calm'); t.textContent='You are a hider';
+      b.innerHTML='<p>Stay hidden. Avoid the seekers.</p><p>Work out who the imposter is, and survive.</p>'; }
+    t.style.opacity=1;b.style.opacity=1;t.classList.add('fadein');
+    $('#b-role-ok').classList.remove('hidden');
+    buzz(120);
+  },1400);
+}
+
+/* ---------- voting ---------- */
+var myVote=null,voteScreenFor=null;
+function renderVote(){
+  var st=G.st;
+  if(voteScreenFor===st.tribunal.which) return;
+  voteScreenFor=st.tribunal.which; myVote=null;
+  mood('vote'); SFX.alarm();
+  $('#voteWhich').textContent=st.tribunal.which===1?'Tribunal 1':'Final tribunal';
+  var list=$('#voteList'); list.innerHTML='';
+  eligibleVoters(st.players).forEach(function(id){
+    var p=st.players[id];
+    var row=document.createElement('div'); row.className='voterow';
+    var c=document.createElement('canvas'); c.width=30;c.height=40; row.appendChild(c);
+    var b=document.createElement('b'); b.textContent=p.name+(id===G.me.id?' (you)':''); row.appendChild(b);
+    var e=document.createElement('em'); e.textContent='still hiding'; row.appendChild(e);
+    row.onclick=function(){
+      myVote=id; SFX.tap();
+      $$('#voteList .voterow').forEach(function(r){r.classList.remove('on');});
+      row.classList.add('on'); $('#b-vote-lock').disabled=false;
+    };
+    list.appendChild(row); paintChar(c,p.char,'S',0);
+  });
+  $('#b-vote-lock').disabled=true; $('#b-vote-lock').textContent='Lock in vote';
+  show('s-vote');
+}
+
+/* ---------- results ---------- */
+function renderResults(){
+  var st=G.st;
+  var w=st.winner;
+  mood(w==='imposter'?'imposter':w==='seekers'?'seeker':'calm');
+  $('#resTitle').textContent=w==='imposter'?'Imposter victory':w==='seekers'?'Seekers win':'Hiders win';
+  $('#resSub').textContent='Match over';
+  $('#resLine').textContent=w==='imposter'?'They played everyone. The imposter turned the hunt against the hiders and was the last one standing.'
+    :w==='seekers'?'Every single hider was hunted down.':'The hiders outlasted the hunt.';
+  if(w==='imposter'){SFX.glitch();buzz([100,60,100,60,300]);} else SFX.reveal();
+  var L=$('#resList'); L.innerHTML='';
+  Object.keys(st.players).forEach(function(id){
+    var p=st.players[id];
+    var row=document.createElement('div'); row.className='resrow';
+    var c=document.createElement('canvas'); c.width=28;c.height=38; row.appendChild(c);
+    var who=document.createElement('div'); who.className='who';
+    var role=(id===st.imposterId)?'imposter':(p.role==='seeker'?'seeker':'hider');
+    var bits=[];
+    if(p.stats.survived) bits.push('survived '+mmss(p.stats.survived));
+    if(p.stats.catches) bits.push(p.stats.catches+' catch'+(p.stats.catches>1?'es':''));
+    if(p.stats.missions) bits.push(p.stats.missions+' missions');
+    if(p.stats.leaks) bits.push(p.stats.leaks+' leaks');
+    if(p.stats.votes) bits.push(p.stats.votes+' votes received');
+    if(p.stats.dist>20) bits.push(Math.round(p.stats.dist)+' m travelled');
+    who.innerHTML='<b>'+p.name+'</b><span>'+(bits.join(' · ')||'—')+'</span>';
+    row.appendChild(who);
+    var tag=document.createElement('div'); tag.className='tag '+role; tag.textContent=role; row.appendChild(tag);
+    L.appendChild(row); paintChar(c,p.char,'S',0);
+  });
+  show('s-results');
+}
+
+/* ---------- HUD ---------- */
+function updateHUD(){
+  var st=G.st,p=me(); if(!st||!p) return;
+  var t=matchT(), s=schedule(st.cfg), hc=huntClock(t);
+  $('#hRole').textContent=p.caught?'CAUGHT':(p.role==='seeker'?'SEEKER':(p.id===st.imposterId&&st.imposterEligible?'IMPOSTER':'HIDER'));
+  if(st.phase==='SCATTER'){ $('#hMatch').textContent=mmss(CFG.scatter-t); }
+  else $('#hMatch').textContent=mmss(Math.max(0,s.end-hc));
+  var zc=$('#hZoneChip');
+  if(st.closing){ $('#hZone').textContent='NOW'; zc.className='chip bad'; }
+  else if(st.zoneCloseAt){ $('#hZone').textContent=mmss((st.zoneCloseAt-now())/1000); zc.className='chip warn'; }
+  else { $('#hZone').textContent='--:--'; zc.className='chip'; }
+  var c=factionCounts(st);
+  $('#hLeft').textContent=c.uncaught.length;
+  var q=G.gps==='virtual'?{label:'SIM',level:2}:gpsQuality(G.pos?G.pos.acc:null);
+  var gEl=$('#hGps'); if(gEl){ gEl.textContent=q.label;
+    $('#hGpsChip').className='chip'+(q.level<=1?' bad':q.level===2?' warn':''); }
+  // in a real match the connection is as much a "can I still play" signal as the GPS
+  var nEl=$('#hNet'), nChip=$('#hNetChip');
+  if(nEl&&nChip){
+    if(G.mode!=='net'){ nChip.classList.add('hidden'); }
+    else {
+      var ns=netStatus();
+      nChip.classList.remove('hidden');
+      nEl.textContent=ns.t.toUpperCase();
+      nChip.className='chip'+(ns.s==='bad'?' bad':ns.s==='warn'?' warn':'');
+    }
+  }
+
+  // task card
+  var card=$('#taskCard'),title=$('#taskTitle'),body=$('#taskBody'),bar=$('#taskBar');
+  var txt=null,ttl=null,prog=null;
+  if(st.phase==='SCATTER'){
+    if(p.role==='seeker'){ ttl='Give them a head start'; txt='The hunt begins in '+mmss(CFG.scatter-t)+'. Stay put.'; }
+    else { ttl='Go!'; txt='Find somewhere safe before the hunt begins. '+mmss(CFG.scatter-t)+' left.'; }
+    if(CFG.scatter-t<10&&Math.floor(t)!==G._lastTick){G._lastTick=Math.floor(t);SFX.tick();}
+  } else if(p.caught){
+    ttl='Caught!'; txt="You're joining the hunt. You become a seeker in "+Math.max(0,Math.ceil(((p.convertAt||now())-now())/1000))+'s.';
+  } else if(now()<st.fullSignalUntil&&p.role!=='seeker'){
+    ttl='You are exposed'; txt='Every seeker can see you for '+Math.ceil((st.fullSignalUntil-now())/1000)+' more seconds. RUN!';
+  } else if(now()<st.fullSignalUntil&&p.role==='seeker'){
+    ttl='Full signal'; txt='All hiders are visible for '+Math.ceil((st.fullSignalUntil-now())/1000)+'s. Go!';
+  } else if(p.outsideSince){
+    var os=outsideState(p,lerpZone(st),now());
+    ttl='Outside safe zone';
+    txt=os.level===0?'Get back inside! '+Math.ceil(os.grace||0)+'s before the seekers start picking you up.'
+      :'The seekers are picking up your signal. Get back inside the circle.';
+    mood('zone');
+  } else if(p.id===st.imposterId&&st.imposterEligible&&st.mission){
+    var m=st.mission;
+    ttl='Secret mission';
+    txt=m.type==='FOLLOW'
+      ? 'Get close to '+((st.players[m.targetId]||{}).name||'them')+' and stay within 25 m for 30 s.\nReward: their area is secretly leaked to the seekers.'
+      : 'Reach the purple spot and hold it for 15 s.\nReward: earn a secret tip.';
+    prog=m.progress/m.need;
+    if(m.active) txt=(m.type==='FOLLOW'?((st.players[m.targetId]||{}).name+' is nearby. Stay close…'):'Holding the spot…')+' '+Math.max(0,Math.ceil(m.need-m.progress))+'s';
+  } else if(p.role==='seeker'){
+    ttl='Hunt'; txt='Watch for signals on your map. Get within 10 m of a hider to catch them.';
+  }
+  if(ttl){ card.classList.remove('hidden'); title.textContent=ttl; body.textContent=txt||'';
+    if(prog!=null){bar.classList.remove('hidden');bar.firstElementChild.style.width=(clamp(prog,0,1)*100)+'%';}
+    else bar.classList.add('hidden');
+  } else card.classList.add('hidden');
+
+  // catch button
+  var cb=$('#catchbtn'),target=null;
+  if(p.role==='seeker'&&!p.caught&&G.pos){
+    var best=1e9;
+    var lp={id:p.id,role:p.role,caught:p.caught,lat:G.pos.lat,lng:G.pos.lng,locT:G.pos.t};
+    Object.keys(st.players).forEach(function(id){
+      var q=st.players[id];
+      if(canCatch(lp,q,now())){ var d=metersBetween(lp,q); if(d<best){best=d;target=q;} }
+    });
+  }
+  if(target){ cb.classList.remove('hidden'); cb.textContent='Catch '+target.name.toUpperCase();
+    cb.onclick=function(){ SFX.caught(); buzz(200); act('catch',target.id); cb.classList.add('hidden'); };
+    if(!G._catchBuzz){G._catchBuzz=1;buzz(60);}
+  } else { cb.classList.add('hidden'); G._catchBuzz=0; }
+
+  // tip button
+  var tb=$('#tipbtn');
+  if(p.id===st.imposterId&&st.imposterEligible&&st.tips>0&&!p.caught){
+    tb.classList.remove('hidden'); tb.textContent='Send secret tip ('+st.tips+')';
+    tb.onclick=openTipMenu;
+  } else tb.classList.add('hidden');
+
+  // mood
+  if(!p.caught&&st.phase.indexOf('HUNT')===0&&now()>=st.fullSignalUntil&&!p.outsideSince){
+    if(p.role==='seeker') mood('seeker');
+    else if(p.id===st.imposterId&&st.imposterEligible&&st.mission&&st.mission.active) mood('imposter');
+    else {
+      var danger=false;
+      Object.keys(st.players).forEach(function(id){
+        var q=st.players[id];
+        if(q.role==='seeker'&&q.lat!=null&&p.lat!=null&&metersBetween(p,q)<70) danger=true;
+      });
+      mood(danger?'danger':'calm');
+    }
+  }
+}
+function openTipMenu(){
+  var st=G.st;
+  var opts=[{k:'near',t:'Hider near me'}];
+  if(st.mission&&st.mission.targetId) opts.push({k:'target',t:"Reveal my target's area"});
+  if(st.objectives&&st.objectives.length) opts.push({k:'obj',t:'Activity near an objective'});
+  modal('Send a secret tip','The seekers will never know it came from you.',opts.map(function(o){
+    return {label:o.t,fn:function(){ act('tip',o.k); SFX.ok(); }};
+  }));
+}
+function modal(title,body,buttons){
+  var d=document.createElement('div');
+  d.style.cssText='position:fixed;inset:0;z-index:95;background:#0b0916f2;display:flex;flex-direction:column;justify-content:center;padding:26px;text-align:center';
+  var h=document.createElement('h1'); h.textContent=title; h.style.fontSize='24px'; d.appendChild(h);
+  var p=document.createElement('p'); p.textContent=body; d.appendChild(p);
+  buttons.forEach(function(b){
+    var el=document.createElement('button'); el.className='btn'; el.textContent=b.label;
+    el.onclick=function(){ document.body.removeChild(d); b.fn&&b.fn(); }; d.appendChild(el);
+  });
+  var c=document.createElement('button'); c.className='btn ghost small'; c.textContent='Cancel';
+  c.onclick=function(){document.body.removeChild(d);}; d.appendChild(c);
+  document.body.appendChild(d);
+}
+
+/* ---------- routing ---------- */
+function route(){
+  var st=G.st; if(!st) return;
+  if(st.phase==='LOBBY'){ if(CUR!=='s-lobby') show('s-lobby'); renderLobby(); return; }
+  if(st.phase==='RESULTS'){ if(CUR!=='s-results') renderResults(); return; }
+  if(!roleShown){ doRoleReveal(); return; }
+  if(CUR==='s-role'){
+    if(matchT()>CFG.scatter*0.6){ show('s-match'); resizeMap(); }  // never leave a player stranded
+    return;
+  }
+  var trib=!!(st.tribunal&&!st.tribunal.done);
+  var mp=me();
+  if(trib&&mp&&!mp.caught&&mp.role!=='seeker'){ renderVote();
+    $('#voteTimer').textContent=Math.max(0,Math.ceil((st.tribunal.endsAt-now())/1000))+'s left';
+    return; }
+  if(CUR==='s-vote'){ voteScreenFor=null; show('s-match'); }
+  if(CUR!=='s-match') show('s-match');
+  if(trib&&mp&&(mp.caught||mp.role==='seeker')){
+    var card=$('#taskCard'); card.classList.remove('hidden');
+    $('#taskTitle').textContent='Tribunal in progress';
+    $('#taskBody').textContent='The hiders are voting. Keep hunting.';
+  }
+}
+
+/* ---------- game loops ---------- */
+var lastUpkeep=0;
+function logicTick(){
+  if(G.st){
+    if(G.isHost){ pushLocalPos(); hostSim(); }
+    drainEvents();
+    route();
+    if(CUR==='s-match') updateHUD();
+    if(now()-lastUpkeep>5000){ lastUpkeep=now(); streetsUpkeep(); }
+  }
+  setTimeout(logicTick,250);
+}
+function frame(){ if(CUR==='s-match') renderMap(); requestAnimationFrame(frame); }
+
+/* ---------- creating / joining ---------- */
+function leaveRoom(){
+  // tell the room straight away rather than making the host wait out the drop timer
+  if(G.mode==='net'&&G.code&&!G.isHost) netDeleteInput(G.code,G.me.id);
+  G.st=null; G.code=null; G.isHost=false; G.mode='solo'; roleShown=false;
+  G.outbox=[]; G.lastSeq={}; G.ack=0; G.seq=0; G.bots=[]; G.dropped={};
+  G.netBusy=false; G.flush=false; G.joinLink=''; G.seenEvent=0;
+}
+function centreNow(){
+  return G.pos?{lat:G.pos.lat,lng:G.pos.lng}:DEFAULT_CENTRE;
+}
+function createGame(solo){
+  // A room code nobody can reach is worse than no room code. If there is no
+  // transport, say so and offer the two things that actually work.
+  if(!solo&&!netAvailable()){
+    modal('No multiplayer connection yet',
+      'This page has nowhere to put the room, so a code would be useless. Set up a free Supabase project once and every device can join by link.',
+      [{label:'Multiplayer setup',fn:function(){ show('s-mp'); renderMpScreen(); }},
+       {label:'Play solo with bots',fn:function(){ createGame(true); }}]);
+    return;
+  }
+  var code=newCode();
+  G.mode=solo?'solo':'net';
+  G.code=G.mode==='net'?code:null;
+  G.isHost=true; roleShown=false; G.seenEvent=0; G.bots=[]; G.render={};
+  G.outbox=[]; G.lastSeq={}; G.ack=0; G.seq=0; G.dropped={};
+  G.netBusy=false; G.lastPush=0; G.lastGoodPull=0;
+  var centre=centreNow();
+  if(!G.pos) virtualStart(centre);
+  var cfg=sanitiseCfg(G.cfg); applyCfg(cfg);
+  G.st=newMatch(code,G.me.id,cfg,centre);
+  var p=newPlayer(G.me.id,G.me.name,G.me.char,true);
+  p.lat=centre.lat;p.lng=centre.lng;p.locT=now();p.online=now();
+  G.st.players[G.me.id]=p;
+  G.view={lat:centre.lat,lng:centre.lng,mpp:1.2};
+  G.joinLink=G.mode==='net'?buildJoinLink(location.href,code,G.mp):'';
+  fetchStreets(centre,Math.max(400,cfg.areaR+200),false);
+  if(solo){ for(var i=0;i<5;i++) addBot(G.st); }
+  if(G.mode==='net') netClearInputs(code).then(pushState).catch(function(e){
+    toast('Could not publish the room: '+((e&&e.message)||'network error'));
+  });
+  show('s-lobby'); renderLobby();
+}
+function joinGame(code){
+  var msg=$('#joinMsg'); msg.textContent='';
+  if(!netAvailable()){
+    msg.textContent='No multiplayer connection set up on this device — open Multiplayer setup, or use the host’s join link.';
+    SFX.bad(); return;
+  }
+  msg.textContent='Looking for '+code+'…';
+  netGetState(code).then(function(s){
+    if(!s||!s.code){ msg.textContent='No game found with that code.'; SFX.bad(); return; }
+    var rejoin=!!s.players[G.me.id];
+    if(!rejoin&&s.phase!=='LOBBY'){ msg.textContent='That match has already started.'; SFX.bad(); return; }
+    if(!rejoin&&s.phase==='RESULTS'){ msg.textContent='That match is over.'; SFX.bad(); return; }
+    if(!rejoin&&Object.keys(s.players).length>=12){ msg.textContent='That lobby is full.'; SFX.bad(); return; }
+    G.mode='net'; G.code=code; G.isHost=false; G.st=s; applyCfg(s.cfg);
+    G.seenEvent=rejoin?s.evId:0; G.render={};
+    G.outbox=[]; G.ack=(s.ack&&s.ack[G.me.id])||0; G.netBusy=false; G.lastPush=0; G.lastGoodPull=now();
+    // a reconnecting player already knows their role; don't replay the reveal at them
+    roleShown=rejoin&&s.phase!=='LOBBY';
+    if(!G.pos) virtualStart({lat:s.zone.lat,lng:s.zone.lng});
+    G.view={lat:s.zone.lat,lng:s.zone.lng,mpp:1.2};
+    G.joinLink=buildJoinLink(location.href,code,G.mp);
+    fetchStreets({lat:s.zone.lat,lng:s.zone.lng},Math.max(400,s.cfg.areaR+200),false);
+    G.flush=true;
+    show(rejoin&&s.phase!=='LOBBY'?'s-match':'s-lobby');
+    if(rejoin&&s.phase!=='LOBBY') resizeMap(); else renderLobby();
+    SFX.ok();
+  }).catch(function(e){
+    msg.textContent='Could not reach the room: '+((e&&e.message)||'network error');
+    SFX.bad();
+  });
+}
+
+/* ---------- dev panel ---------- */
+function devButton(label,fn){ return {label:label,fn:fn}; }
+function buildDev(){
+  var groups=[
+    ['MATCH',[
+      devButton('+ bot',function(){ if(G.st){addBot(G.st);renderLobby();} }),
+      devButton('start match',function(){ if(G.st)startMatch(G.st); }),
+      devButton('skip scatter',function(){ if(G.st&&G.st.t0)G.st.t0-=CFG.scatter*1000; }),
+      devButton('+2 min',function(){ if(G.st&&G.st.t0)G.st.t0-=120000; }),
+      devButton('to tribunal 1',function(){ jumpTo(schedule(G.st.cfg).t1-2); }),
+      devButton('to final tribunal',function(){ jumpTo(schedule(G.st.cfg).t2-2); }),
+      devButton('to endgame',function(){ jumpTo(schedule(G.st.cfg).t2End+2); })
+    ]],
+    ['VOTE',[
+      devButton('sim correct vote',function(){ simVote(true); }),
+      devButton('sim wrong vote',function(){ simVote(false); }),
+      devButton('full signal ON',function(){ G.st.fullSignalUntil=now()+60000;
+        pushEvent(G.st,'all','fullsignal','FULL SIGNAL','All hiders are exposed for 60 seconds. RUN!'); }),
+      devButton('full signal OFF',function(){ G.st.fullSignalUntil=0;
+        pushEvent(G.st,'all','signal','SIGNAL LOST','The hiders are hidden again.'); })
+    ]],
+    ['CATCH',[
+      devButton('catch a hider',function(){ var st=G.st;
+        var ids=factionCounts(st).uncaught.filter(function(i){return i!==G.me.id;});
+        if(!ids.length) return; var t=st.players[ids[0]];
+        t.caught=true;t.convertAt=now()+CFG.conversion*1000;
+        pushEvent(st,'all','caught','HIDER CAUGHT',t.name+' has been caught.'); }),
+      devButton('convert now',function(){ Object.keys(G.st.players).forEach(function(i){
+        var p=G.st.players[i]; if(p.caught) p.convertAt=now()-1; }); }),
+      devButton('catch me',function(){ var p=me(); p.caught=true;p.convertAt=now()+CFG.conversion*1000;
+        pushEvent(G.st,G.me.id,'you-caught','CAUGHT!',"You're joining the hunt."); })
+    ]],
+    ['ZONE',[
+      devButton('reveal next zone',function(){ var st=G.st;
+        st.next=nextZone(mulberry32(now()|0),st.zone); st.zoneCloseAt=now()+20000;
+        pushEvent(st,'all','zone','NEXT ZONE REVEALED','The safe area is moving.'); }),
+      devButton('close zone now',function(){ var st=G.st;
+        if(!st.next) st.next=nextZone(mulberry32(now()|0),st.zone);
+        st.closing={from:JSON.parse(JSON.stringify(st.zone)),at:now()};
+        pushEvent(st,'all','zone','ZONE IS CLOSING','Get inside the new circle.'); }),
+      devButton('teleport to zone',function(){ G.pos={lat:G.st.zone.lat,lng:G.st.zone.lng,acc:5,t:now()};pushLocalPos(); })
+    ]],
+    ['IMPOSTER',[
+      devButton('new mission',function(){ newMission(G.st,mulberry32(now()|0)); }),
+      devButton('complete mission',function(){ if(G.st.mission)G.st.mission.progress=G.st.mission.need; }),
+      devButton('+1 tip',function(){ G.st.tips++; }),
+      devButton('make me imposter',function(){ G.st.imposterId=G.me.id;G.st.imposterEligible=true;
+        G.st.players[G.me.id].role='imposter';roleShown=false; })
+    ]],
+    ['END',[
+      devButton('hiders win',function(){ endMatch(G.st,{winner:'hiders'}); }),
+      devButton('seekers win',function(){ endMatch(G.st,{winner:'seekers'}); }),
+      devButton('imposter win',function(){ endMatch(G.st,{winner:'imposter'}); })
+    ]],
+    ['SIM',[
+      devButton('toggle drag-to-move',function(){ G.simMove=!G.simMove; toast('Drag to move: '+(G.simMove?'ON':'OFF')); }),
+      devButton('freeze bots',function(){ G.botsFrozen=!G.botsFrozen;
+        if(G.botsFrozen){G._bots=G.bots;G.bots=[];}else{G.bots=G._bots||[];} }),
+      devButton('toggle map style',function(){ CFG.mapStyle=CFG.mapStyle==='real'?'pixel':'real';
+        toast('Map: '+CFG.mapStyle); }),
+      devButton('map status',function(){ toast(mapSourceLabel()); }),
+      devButton('gps debug',function(){ toast('acc '+Math.round((G.pos&&G.pos.acc)||0)+'m raw '+
+        Math.round(G.rawAcc||0)+'m · kept '+(GPSF?GPSF.accepted:0)+' dropped '+(GPSF?GPSF.rejected:0)); }),
+      devButton('net status',function(){ var s=netStatus();
+        toast(netLabel()+' · '+s.t+' · ok '+NET.ok+' fail '+NET.fails+(NET.lastErr?' · '+NET.lastErr:'')); }),
+      devButton('force sync now',function(){ G.flush=true; toast('Sync queued'); }),
+      devButton('drop a player',function(){ var st=G.st;
+        var ids=Object.keys(st.players).filter(function(i){return i!==G.me.id&&!st.players[i].caught;});
+        // Prefer an uncaught bot hider — that is the case the drop handling exists for.
+        // Silencing a real phone just gets undone on its next push, and a seeker going
+        // quiet is deliberately left alone.
+        var pick=ids.filter(function(i){return st.players[i].bot&&st.players[i].role!=='seeker';});
+        if(!pick.length) pick=ids.filter(function(i){return st.players[i].bot;});
+        if(!pick.length) pick=ids;
+        if(!pick.length) return; var p=st.players[pick[0]];
+        p.bot=false; p.online=now()-(CFG.dropLost+5)*1000; G.bots=G.bots.filter(function(b){return b!==ids[0];});
+        toast(p.name+' now looks disconnected'); }),
+      devButton('log state',function(){ console.log(JSON.parse(JSON.stringify(G.st))); toast('State logged to console'); })
+    ]]
+  ];
+  var d=$('#dev'); d.innerHTML='';
+  groups.forEach(function(g){
+    var h=document.createElement('h5'); h.textContent=g[0]; d.appendChild(h);
+    var grid=document.createElement('div'); grid.className='grid';
+    g[1].forEach(function(b){
+      var el=document.createElement('button'); el.textContent=b.label;
+      el.onclick=function(){ if(!G.st){toast('Start a game first');return;} b.fn(); };
+      grid.appendChild(el);
+    });
+    d.appendChild(grid);
+  });
+  var pre=document.createElement('pre'); pre.id='devlog'; d.appendChild(pre);
+  renderDevLog();
+  setInterval(function(){ renderDevLog(); },500);
+}
+/* The dev log is the only window into a networked match while it is running —
+   it has to show what the other phone did, not just what this one thinks. */
+function renderDevLog(){
+  var el=$('#devlog'); if(!el||!G.st) return;
+  var st=G.st,c=factionCounts(st),n=now();
+  var ids=Object.keys(st.players);
+  var live=ids.filter(function(i){return presence(st.players[i],n)==='live';}).length;
+  var lost=ids.filter(function(i){return presence(st.players[i],n)==='lost';}).length;
+  var ns=netStatus();
+  var lines=[
+    'phase '+st.phase+'  t='+Math.round(matchT())+'s  mode='+G.mode+(G.isHost?' [host]':' [client]'),
+    'players '+ids.length+'  uncaught '+c.uncaught.length+'  genuine '+c.genuine.length,
+    'presence live '+live+'  lost '+lost+'  of '+ids.length,
+    'zone r='+Math.round(lerpZone(st).r)+'m stage '+st.zoneStage+(st.next?' (next revealed)':''),
+    'imposter '+(st.imposterId?(st.players[st.imposterId]||{}).name:'none')+(st.imposterEligible?'':' [EXPOSED]')+
+      '  tips '+st.tips,
+    'net '+netLabel().toLowerCase()+' '+ns.t.toLowerCase()+'  ok '+NET.ok+'  fail '+NET.fails+
+      '  ver '+st.ver+'  pending '+pendingActions(G.outbox,G.ack).length,
+    'gps '+G.gps+(G.pos?' acc '+Math.round(G.pos.acc||0)+'m':'')
+  ];
+  if(st.tribunal&&!st.tribunal.done)
+    lines.push('tribunal '+st.tribunal.which+' votes '+Object.keys(st.tribunal.votes).length+
+               '/'+presentVoters(st.players,n).length);
+  el.textContent=lines.join('\n');
+}
+function jumpTo(huntSeconds){
+  if(!G.st||!G.st.t0) return;
+  G.st.t0=now()-(CFG.scatter+huntSeconds)*1000;
+}
+function simVote(correct){
+  var st=G.st; if(!st.tribunal||st.tribunal.done){
+    st.tribunal={which:st.tribunalsDone?2:1,endsAt:now()+1000,votes:{},done:false};
+  }
+  var voters=eligibleVoters(st.players);
+  var target=correct?st.imposterId:voters.filter(function(i){return i!==st.imposterId;})[0];
+  voters.forEach(function(v){ st.tribunal.votes[v]=target; });
+  resolveTribunal(st);
+}
+
+
+/* ---------- map & GPS diagnostics ---------- */
+var GPSERR=null,GPSTRY=0;
+function diagRows(){
+  var rows=[];
+  var secure=(typeof window.isSecureContext!=='undefined')?window.isSecureContext:(location.protocol==='https:');
+  rows.push({s:secure?'ok':'bad',t:'Secure connection',
+    d:secure?'Served over https, so the browser will hand over your location.'
+      :'This page is not on https. Phone browsers refuse GPS to insecure pages — that alone will block real location. Host the file (Netlify Drop, GitHub Pages) and open the https link.'});
+  var inFrame=(function(){try{return window.self!==window.top;}catch(e){return true;}})();
+  rows.push({s:inFrame?'warn':'ok',t:'Running in a frame',
+    d:inFrame?'This page is inside another page. A frame only gets location and outside map data if its host allows it — open the file on its own to rule this out.'
+      :'Running as its own page, so nothing upstream is filtering permissions.'});
+  var gq=G.pos?gpsQuality(G.pos.acc):{label:'NO FIX',level:0};
+  rows.push({s:!navigator.geolocation?'bad':(G.gps==='ok'?'ok':G.gps==='weak'?'warn':'bad'),t:'Location',
+    d:!navigator.geolocation?'This browser has no geolocation at all.'
+      :G.pos&&G.gps!=='virtual'?('Fix accurate to about '+Math.round(G.pos.acc)+' m ('+gq.label+'), raw reading '+Math.round(G.rawAcc||0)+' m. Kept '+(GPSF?GPSF.accepted:0)+' fixes, discarded '+(GPSF?GPSF.rejected:0)+'.')
+      :(GPSERR||'No fix yet. Outdoors with a clear sky it usually takes 10–30 seconds.')});
+  rows.push({s:STREETS.status==='ok'?'ok':STREETS.status==='loading'?'warn':'bad',t:'Street data',
+    d:STREETS.status==='ok'?(STREETS.ways.length+' roads, paths and buildings loaded for this area'+(STREETS.cached?' from your cache — works offline now.':'.'))
+      :STREETS.status==='loading'?('Downloading from OpenStreetMap — trying '+OVERPASS.length+' mirrors…')
+      :STREETS.status==='fail'?('Could not reach OpenStreetMap: '+STREETS.err+'. The generated pixel world is being used instead.')
+      :'Not requested yet — open Create game so the app knows where you are playing.'});
+  var gN=(STREETS.graph&&STREETS.graph.n)||0;
+  rows.push({s:gN?'ok':'warn',t:'Walkable roads',
+    d:gN?(gN+' road and path segments are being used to place objectives and keep bots on the street.')
+      :'No road network yet, so objectives fall back to open ground anywhere in the circle.'});
+  var ns=netStatus();
+  rows.push({s:NET.kind==='none'?'warn':ns.s,t:'Multiplayer',
+    d:NET.kind==='none'?'No transport set up. Create game will only offer solo play — open Multiplayer setup to connect a Supabase project.'
+      :(netLabel()+' · '+ns.t+(G.code?' · room '+G.code:' · no room open')+
+        (NET.lastErr?'. Last error: '+NET.lastErr:'.'))});
+  rows.push({s:TILE.loaded?'ok':TILE.fails?'warn':'warn',t:'Map tiles (backup)',
+    d:TILE.loaded?(TILE.loaded+' tiles loaded.'):TILE.fails?('Blocked or unreachable after '+TILE.fails+' attempts. Streets or the pixel world will be used.'):'Not needed yet.'});
+  rows.push({s:'ok',t:'Currently drawing',d:mapSourceLabel()});
+  return rows;
+}
+function renderDiag(){
+  var b=document.getElementById('diagBody'); if(!b) return;
+  b.innerHTML='';
+  diagRows().forEach(function(r){
+    var d=document.createElement('div'); d.className='diagrow '+r.s;
+    var dot=document.createElement('div'); dot.className='dot'; d.appendChild(dot);
+    var t=document.createElement('div'); t.className='txt';
+    var bb=document.createElement('b'); bb.textContent=r.t;
+    var sp=document.createElement('span'); sp.textContent=r.d;
+    t.appendChild(bb); t.appendChild(sp); d.appendChild(t); b.appendChild(d);
+  });
+}
+function requestFix(){
+  if(!navigator.geolocation){ GPSERR='This browser has no geolocation.'; renderDiag(); return; }
+  GPSTRY++;
+  navigator.geolocation.getCurrentPosition(function(pos){
+    GPSERR=null;
+    var raw={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy,t:now()};
+    G.rawAcc=pos.coords.accuracy;
+    var f=(GPSF&&GPSF.push(raw))||raw;
+    G.pos={lat:f.lat,lng:f.lng,acc:f.acc,t:now()};
+    G.gps=gpsQuality(f.acc).level<=1?'weak':'ok'; G.simMove=false;
+    fetchStreets({lat:G.pos.lat,lng:G.pos.lng},Math.max(400,G.cfg.areaR+200),false);
+    renderDiag();
+  },function(err){
+    GPSERR=err&&err.code===1?'Permission denied. Allow location for this site in your browser settings, then try again.'
+      :err&&err.code===2?'Your phone could not get a position. Step outside and try again.'
+      :err&&err.code===3?'Timed out waiting for a fix. Try again with a clear view of the sky.'
+      :'Location failed.';
+    G.gps='denied'; renderDiag();
+  },{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+}
+
+/* ---------- how to play ---------- */
+function buildHowTo(){
+  var blocks=[
+    ['HIDER','Hide. Avoid the seekers. Work out who the imposter is. Survive to the end.','#63c77c',0],
+    ['SEEKER','Find hiders and get within 10 metres to catch them. Everyone you catch becomes a seeker too.','#f2a63b',4],
+    ['IMPOSTER','You look like a hider. Secretly help the seekers catch people. Be the last hider standing and you win alone.','#a05ce0',8],
+    ['VOTING','Twice per match everyone still hiding votes. Correct = the imposter is stopped. Wrong = every hider is revealed. Skip = nothing happens.','#43b0e8',2],
+    ['THE ZONE','Stay inside the circle. It shrinks AND moves somewhere new each time — you cannot camp in one spot.','#e8503a',6]
+  ];
+  var wrap=$('#howtoBody'); wrap.innerHTML='';
+  blocks.forEach(function(b){
+    var d=document.createElement('div'); d.className='panel';
+    d.style.display='flex'; d.style.gap='12px'; d.style.alignItems='center';
+    var c=document.createElement('canvas'); c.width=36;c.height=48; d.appendChild(c);
+    var t=document.createElement('div');
+    t.innerHTML='<h2 style="font-size:15px;color:'+b[2]+'">'+b[0]+'</h2><p style="font-size:12px;margin:4px 0 0">'+b[1]+'</p>';
+    d.appendChild(t); wrap.appendChild(d); paintChar(c,b[3],'S',0);
+  });
+}
+
+/* ---------- scene decor ---------- */
+function paintScene(id){
+  var c=document.getElementById(id); if(!c) return;
+  var x=c.getContext('2d'); x.imageSmoothingEnabled=false;
+  x.fillStyle='#1a1d2b'; x.fillRect(0,0,c.width,c.height);
+  var r=mulberry32(42);
+  for(var i=0;i<40;i++){ x.fillStyle=r()<0.5?'#242a3d':'#20263a';
+    var w=6+r()*18,h=8+r()*40; x.fillRect(Math.floor(r()*c.width),c.height-h,w,h); }
+  for(i=0;i<24;i++){ x.fillStyle='rgba(242,166,59,.8)';
+    x.fillRect(Math.floor(r()*c.width),Math.floor(c.height-40*r()-8),2,2); }
+  x.fillStyle='#151826'; x.fillRect(0,c.height-8,c.width,8);
+  var t=Math.floor(now()/400)%2;
+  drawChar(x,G.me.char,'S',t,2,c.width/2-14,c.height-8-36);
+  x.fillStyle='rgba(67,176,232,.35)';
+  x.fillRect(0,0,c.width,2);
+}
+
+
+/* ============================================================
+   PART 6 — real map tiles, match settings, GPS readout
+   ============================================================ */
+var TILE={on:true,cache:{},loaded:0,fails:0,off:null,octx:null};
+function tileImg(x,y,z){
+  var key=z+'/'+x+'/'+y, t=TILE.cache[key];
+  if(!t){
+    t={img:new Image(),ok:false};
+    t.img.crossOrigin='anonymous';
+    t.img.onload=function(){t.ok=true;TILE.loaded++;};
+    t.img.onerror=function(){t.err=true;TILE.fails++;
+      if(TILE.fails>=4&&TILE.loaded===0){ TILE.on=false; }};
+    t.img.src='https://tile.openstreetmap.org/'+z+'/'+x+'/'+y+'.png';
+    TILE.cache[key]=t;
+    var keys=Object.keys(TILE.cache);
+    if(keys.length>240) delete TILE.cache[keys[0]];
+  }
+  return t;
+}
+function drawTiles(){
+  if(!TILE.on||CFG.mapStyle!=='real') return false;
+  var z=zoomForMpp(G.view.lat,G.view.mpp);
+  var tm=tileMpp(G.view.lat,z)*256, px=tm/G.view.mpp;
+  if(!isFinite(px)||px<32) return false;
+  var W=Math.max(1,Math.floor(VW/2)),H=Math.max(1,Math.floor(VH/2));
+  if(!TILE.off){ TILE.off=document.createElement('canvas'); TILE.octx=TILE.off.getContext('2d'); }
+  if(TILE.off.width!==W||TILE.off.height!==H){ TILE.off.width=W; TILE.off.height=H; }
+  var o=TILE.octx; o.imageSmoothingEnabled=false;
+  o.fillStyle='#1a1f2b'; o.fillRect(0,0,W,H);
+  var cx=lon2tile(G.view.lng,z), cy=lat2tile(G.view.lat,z), n=Math.pow(2,z);
+  var hx=Math.ceil(W/(px/2)/2)+1, hy=Math.ceil(H/(px/2)/2)+1, drew=0;
+  for(var i=-hx;i<=hx;i++) for(var j=-hy;j<=hy;j++){
+    var tx=Math.floor(cx)+i, ty=Math.floor(cy)+j;
+    if(ty<0||ty>=n) continue;
+    var t=tileImg(((tx%n)+n)%n,ty,z);
+    if(!t.ok) continue;
+    var sx=W/2+(tx-cx)*px/2, sy=H/2+(ty-cy)*px/2;
+    o.drawImage(t.img,Math.floor(sx),Math.floor(sy),Math.ceil(px/2)+1,Math.ceil(px/2)+1);
+    drew++;
+  }
+  if(!drew) return false;
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(TILE.off,0,0,VW,VH);
+  // knock the real map back so the game layer reads on top of it
+  ctx.fillStyle='rgba(14,12,26,0.52)'; ctx.fillRect(0,0,VW,VH);
+  ctx.fillStyle='rgba(67,176,232,0.06)'; ctx.fillRect(0,0,VW,VH);
+  ctx.font='700 9px Helvetica,Arial,sans-serif'; ctx.textAlign='left';
+  ctx.fillStyle='rgba(242,236,223,.45)'; ctx.fillText('© OpenStreetMap',8,VH-6);
+  ctx.textAlign='center';
+  return true;
+}
+
+/* ---------- match settings ---------- */
+var PRESETS={
+  quick:{matchLen:1200,areaR:250,scatter:120},
+  standard:{matchLen:2700,areaR:450,scatter:180},
+  long:{matchLen:3600,areaR:800,scatter:240}
+};
+var SETUP=[
+  {sec:'The basics'},
+  {k:'matchLen',t:'Match length',type:'range',min:600,max:5400,step:300,
+   fmt:function(v){return Math.round(v/60)+' min';},h:'Total hunt time, not counting votes.'},
+  {k:'areaR',t:'Play area',type:'range',min:100,max:1500,step:50,
+   fmt:function(v){return v+' m';},h:'Radius of the starting circle around you. 450 m suits a park or a few streets.'},
+  {k:'scatter',t:'Head start',type:'range',min:30,max:600,step:30,
+   fmt:function(v){return mmss(v);},h:'How long hiders get to run before the seeker moves.'},
+  {sec:'Catching'},
+  {k:'catchRadius',t:'Catch distance',type:'range',min:5,max:30,step:1,
+   fmt:function(v){return v+' m';},h:'How close a seeker must be to catch someone. Small = tense. Large = forgiving in built-up areas.'},
+  {k:'gpsForgive',t:'GPS allowance',type:'seg',opts:[[1,'On'],[0,'Strict']],
+   h:'On: adds a little slack when phone accuracy is poor, so real tags are not refused.'},
+  {k:'conversion',t:'Time to turn seeker',type:'range',min:10,max:180,step:5,
+   fmt:function(v){return v+'s';},h:'Grace period after being caught, so nobody gets chain-caught.'},
+  {k:'trackScale',t:'Seeker signals',type:'seg',opts:[[1.4,'Loose'],[1,'Normal'],[0.6,'Tight']],
+   h:'How precise the blips on a seeker map are. Tight makes hiding much harder.'},
+  {sec:'The zone'},
+  {k:'zoneStages',t:'Zone moves',type:'range',min:0,max:8,step:1,
+   fmt:function(v){return v===0?'never':v+'×';},h:'How many times the safe circle shrinks and relocates.'},
+  {k:'zoneShrink',t:'Shrink per move',type:'range',min:0.4,max:0.95,step:0.05,
+   fmt:function(v){return Math.round(v*100)+'%';},h:'Each new circle is this fraction of the last one.'},
+  {sec:'Imposter & voting'},
+  {k:'imposters',t:'Imposter',type:'seg',opts:[[1,'1 imposter'],[0,'None']],
+   h:'Off turns the game into a plain manhunt. Needs 3+ players.'},
+  {k:'tribunals',t:'Votes per match',type:'seg',opts:[[2,'2'],[1,'1'],[0,'None']],
+   h:'Scheduled tribunals where the hiders accuse someone.'},
+  {k:'fullSignal',t:'Wrong-vote exposure',type:'range',min:20,max:180,step:10,
+   fmt:function(v){return v+'s';},h:'How long every hider is visible after a wrong vote. The final vote adds 30s.'},
+  {k:'objectives',t:'Objectives',type:'seg',opts:[[1,'On'],[0,'Off']],
+   h:'Jammer and intel pickups that give hiders a reason to keep moving.'},
+  {sec:'Map'},
+  {k:'mapStyle',t:'Map style',type:'seg',opts:[['real','Real streets'],['pixel','Pixel world']],
+   h:'Real streets uses OpenStreetMap under the game layer. Pixel world is generated and works with no connection.'}
+];
+function buildSetup(){
+  var body=$('#setupBody'); if(!body) return;
+  body.innerHTML='';
+  setTimeout(drawPreview,0);
+  SETUP.forEach(function(item){
+    if(item.sec){ var s=document.createElement('div'); s.className='setsec'; s.textContent=item.sec; body.appendChild(s); return; }
+    var row=document.createElement('div'); row.className='setrow';
+    var top=document.createElement('div'); top.className='top';
+    var b=document.createElement('b'); b.textContent=item.t;
+    var val=document.createElement('i'); top.appendChild(b); top.appendChild(val); row.appendChild(top);
+    if(item.type==='range'){
+      var r=document.createElement('input'); r.type='range';
+      r.min=item.min;r.max=item.max;r.step=item.step;r.value=G.cfg[item.k];
+      val.textContent=item.fmt(+r.value);
+      r.oninput=function(){ G.cfg[item.k]=+r.value; val.textContent=item.fmt(+r.value); pvFocus(item.k,row); };
+      r.onchange=function(){ SFX.tap(); };
+      r.onpointerdown=function(){ pvFocus(item.k,row); };
+      row.appendChild(r);
+    } else {
+      var seg=document.createElement('div'); seg.className='seg'; seg.style.margin='8px 0 0';
+      item.opts.forEach(function(o){
+        var btn=document.createElement('button');
+        btn.textContent=o[1];
+        if(String(G.cfg[item.k])===String(o[0])) btn.classList.add('on');
+        btn.onclick=function(){
+          G.cfg[item.k]=o[0]; SFX.tap(); pvFocus(item.k,row);
+          Array.prototype.forEach.call(seg.children,function(c){c.classList.remove('on');});
+          btn.classList.add('on'); val.textContent='';
+        };
+        seg.appendChild(btn);
+      });
+      row.appendChild(seg);
+    }
+    if(item.h){ var sm=document.createElement('small'); sm.textContent=item.h; row.appendChild(sm); }
+    row.addEventListener('click',function(){ pvFocus(item.k,row); });
+    body.appendChild(row);
+  });
+}
+
+
+/* ---------- street layer: fetch, cache, render ---------- */
+var STREETS={status:'idle',ways:[],centre:null,radius:0,err:null,at:0,graph:null,source:null};
+function setStreets(ways,centre,radius,extra){
+  STREETS={status:'ok',ways:ways,centre:{lat:centre.lat,lng:centre.lng},radius:radius,
+    err:null,at:now(),graph:buildRoadGraph(ways),
+    cached:!!(extra&&extra.cached),source:(extra&&extra.source)||null};
+  return STREETS;
+}
+/* Overpass mirrors are tried in turn: the main endpoint rate-limits constantly, and
+   "the map is a grey grid today" is the most visible failure this game has. */
+function overpassTry(centre,radius,i){
+  i=i||0;
+  if(i>=OVERPASS.length) return Promise.reject(new Error('all Overpass mirrors failed'));
+  var ctrl=(typeof AbortController!=='undefined')?new AbortController():null;
+  var timer=ctrl?setTimeout(function(){try{ctrl.abort();}catch(e){}},20000):null;
+  return fetch(OVERPASS[i],{
+    method:'POST',body:'data='+encodeURIComponent(overpassQuery(centre,radius)),
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    signal:ctrl?ctrl.signal:undefined
+  }).then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(function(j){
+      var ways=parseOverpass(j,centre);
+      if(!ways.length) throw new Error('no streets returned');
+      return {ways:ways,source:OVERPASS[i]};
+    })
+    .catch(function(e){
+      if(i+1>=OVERPASS.length) throw e;
+      return overpassTry(centre,radius,i+1);
+    })
+    .then(function(v){ if(timer) clearTimeout(timer); return v; },
+          function(e){ if(timer) clearTimeout(timer); throw e; });
+}
+function fetchStreets(centre,radius,force){
+  if(!centre) return;
+  if(STREETS.status==='loading') return;
+  if(!force&&STREETS.centre&&metersBetween(STREETS.centre,centre)<radius*0.35&&STREETS.radius>=radius&&STREETS.status==='ok') return;
+  var key=streetsCacheKey(centre,radius);
+  STREETS.status='loading'; STREETS.err=null;
+  var useCache=function(){
+    if(force||!window.storage) return Promise.resolve(null);
+    return window.storage.get(key,false).then(function(r){return r?JSON.parse(r.value):null;}).catch(function(){return null;});
+  };
+  useCache().then(function(cached){
+    if(cached&&cached.ways&&cached.ways.length){
+      setStreets(cached.ways,cached.centre,cached.radius,{cached:true});
+      return null;
+    }
+    return overpassTry(centre,radius).then(function(res){
+      setStreets(res.ways,centre,radius,{source:res.source});
+      try{ if(window.storage) window.storage.set(key,JSON.stringify({ways:res.ways,centre:STREETS.centre,radius:radius}),false); }catch(e){}
+      return null;
+    });
+  }).catch(function(e){
+    STREETS.status='fail'; STREETS.at=now();
+    STREETS.err=(e&&e.message)||'blocked';
+    if(/Failed to fetch|NetworkError|blocked|CSP|abort/i.test(STREETS.err)) STREETS.err='blocked or offline';
+  });
+}
+/* Street data was fetched once, at the lobby, around wherever the host was standing.
+   Players run. Without this the map simply runs out of roads at the edge of that
+   first download and the game silently falls back to the generated world. */
+function streetsUpkeep(){
+  if(CFG.mapStyle!=='real') return;
+  var here=G.pos||(G.st?G.st.zone:null); if(!here) return;
+  var want=Math.max(400,((G.st&&G.st.cfg&&G.st.cfg.areaR)||G.cfg.areaR)+200);
+  if(STREETS.status==='loading') return;
+  if(STREETS.status==='fail'&&now()-(STREETS.at||0)<30000) return;
+  if(STREETS.status!=='ok'){ STREETS.at=now(); fetchStreets(here,want,false); return; }
+  if(metersBetween(STREETS.centre,here)>Math.max(120,STREETS.radius*0.5)) fetchStreets(here,want,false);
+}
+function drawStreets(){
+  if(CFG.mapStyle==='pixel'||STREETS.status!=='ok'||!STREETS.ways.length) return false;
+  var c=STREETS.centre, mpp=G.view.mpp;
+  var ox=metersBetween({lat:c.lat,lng:c.lng},{lat:c.lat,lng:G.view.lng})*(G.view.lng>c.lng?1:-1);
+  var oy=metersBetween({lat:c.lat,lng:c.lng},{lat:G.view.lat,lng:c.lng})*(G.view.lat>c.lat?1:-1);
+  var halfW=VW/2*mpp, halfH=VH/2*mpp;
+  var box=[ox-halfW-40,oy-halfH-40,ox+halfW+40,oy+halfH+40];
+  var sx=function(x){return VW/2+(x-ox)/mpp;}, sy=function(y){return VH/2-(y-oy)/mpp;};
+  ctx.fillStyle='#171a26'; ctx.fillRect(0,0,VW,VH);
+  ctx.lineJoin='round'; ctx.lineCap='round';
+  var vis=[],i,w;
+  for(i=0;i<STREETS.ways.length;i++){ w=STREETS.ways[i]; if(wayVisible(w,box)) vis.push(w); }
+  function trace(w){
+    ctx.beginPath(); ctx.moveTo(sx(w.p[0]),sy(w.p[1]));
+    for(var j=2;j<w.p.length;j+=2) ctx.lineTo(sx(w.p[j]),sy(w.p[j+1]));
+  }
+  // ground fills first
+  ['park','water','building'].forEach(function(kind){
+    ctx.fillStyle=kind==='park'?'#223d2b':kind==='water'?'#1b3247':'#272c3c';
+    for(i=0;i<vis.length;i++){ w=vis[i]; if(w.k!==kind) continue; trace(w); ctx.closePath(); ctx.fill();
+      if(kind==='building'){ ctx.strokeStyle='#31374b'; ctx.lineWidth=1; ctx.stroke(); } }
+  });
+  // road casings then surfaces, so junctions read cleanly
+  ['minor','road','major'].forEach(function(kind){
+    var st=ROAD_STYLE(kind); if(!st||!st.cc) return;
+    ctx.strokeStyle=st.cc; ctx.lineWidth=Math.max(2,st.w/Math.max(0.35,mpp))+3;
+    for(i=0;i<vis.length;i++){ w=vis[i]; if(w.k!==kind) continue; trace(w); ctx.stroke(); }
+  });
+  ['minor','road','major','path'].forEach(function(kind){
+    var st=ROAD_STYLE(kind); if(!st) return;
+    ctx.strokeStyle=st.c; ctx.lineWidth=Math.max(kind==='path'?1:2,st.w/Math.max(0.35,mpp));
+    if(st.dash) ctx.setLineDash(st.dash);
+    for(i=0;i<vis.length;i++){ w=vis[i]; if(w.k!==kind) continue; trace(w); ctx.stroke(); }
+    ctx.setLineDash([]);
+  });
+  ctx.font='700 9px Helvetica,Arial,sans-serif'; ctx.textAlign='left';
+  ctx.fillStyle='rgba(242,236,223,.4)'; ctx.fillText('© OpenStreetMap contributors',8,VH-6);
+  ctx.textAlign='center';
+  return true;
+}
+function mapSourceLabel(){
+  if(CFG.mapStyle==='pixel') return 'Pixel world (generated)';
+  if(STREETS.status==='ok') return 'Real streets'+(STREETS.cached?' (cached)':'')+' · '+STREETS.ways.length+' features';
+  if(STREETS.status==='loading') return 'Downloading streets…';
+  if(TILE.loaded>0) return 'Map tiles';
+  if(STREETS.status==='fail') return 'Streets unavailable ('+STREETS.err+') — pixel world';
+  return 'Pixel world (generated)';
+}
+
+/* ---------- live scale preview on the rules screen ---------- */
+var PV={focus:'areaR',dirty:true};
+function withCanvas(pctx,w,h,view,fn){
+  var oc=ctx,ow=VW,oh=VH,ov=G.view;
+  ctx=pctx; VW=w; VH=h; G.view=view;
+  try{ fn(); } finally { ctx=oc; VW=ow; VH=oh; G.view=ov; }
+}
+var PV_MODE={matchLen:'area',areaR:'area',scatter:'run',catchRadius:'catch',gpsForgive:'catch',
+  conversion:'run',trackScale:'signal',zoneStages:'zones',zoneShrink:'zones',
+  imposters:'area',tribunals:'area',fullSignal:'run',objectives:'area',mapStyle:'area'};
+function pvRing(c,r,col,dash,width){
+  ctx.save(); if(dash) ctx.setLineDash(dash);
+  ctx.strokeStyle=col; ctx.lineWidth=width||2;
+  ctx.beginPath(); ctx.arc(c.x,c.y,r,0,6.2832); ctx.stroke(); ctx.restore();
+}
+function pvScaleBar(mpp){
+  var b=scaleBarFor(mpp,Math.min(140,VW*0.42));
+  var x=10,y=VH-12;
+  ctx.fillStyle='rgba(11,9,22,.78)'; ctx.fillRect(x-4,y-16,b.px+8,22);
+  ctx.fillStyle='#f2ecdf'; ctx.fillRect(x,y,b.px,2);
+  ctx.fillRect(x,y-4,2,6); ctx.fillRect(x+b.px-2,y-4,2,6);
+  ctx.font='700 9px Helvetica,Arial,sans-serif'; ctx.textAlign='left';
+  ctx.fillText(b.m+' m',x,y-6); ctx.textAlign='center';
+}
+function drawPreview(){
+  var c=document.getElementById('setupMap'); if(!c) return;
+  var W=c.clientWidth||320,H=190;
+  var dpr=Math.min(2,window.devicePixelRatio||1);
+  if(c.width!==Math.floor(W*dpr)){ c.width=Math.floor(W*dpr); c.height=Math.floor(H*dpr); }
+  var p=c.getContext('2d');
+  p.setTransform(dpr,0,0,dpr,0,0); p.imageSmoothingEnabled=false;
+  var cfg=sanitiseCfg(G.cfg); applyCfg(cfg);
+  var mode=PV_MODE[PV.focus]||'area';
+  var centre=G.pos||DEFAULT_CENTRE;
+  var extra={runSecs:PV.focus==='scatter'?cfg.scatter:(PV.focus==='fullSignal'?cfg.fullSignal:cfg.conversion),
+             unc:110*cfg.trackScale, areaR:cfg.areaR};
+  var mpp=previewMpp(mode,extra,Math.min(W,H));
+  var view={lat:centre.lat,lng:centre.lng,mpp:mpp};
+  var cap='',sub='';
+  withCanvas(p,W,H,view,function(){
+    var z={lat:centre.lat,lng:centre.lng,r:cfg.areaR};
+    if(!drawTiles()) drawTerrain(z);
+    var mid={x:W/2,y:H/2};
+    if(mode==='area'){
+      var r=cfg.areaR/mpp;
+      ctx.save(); ctx.beginPath(); ctx.rect(0,0,W,H);
+      ctx.arc(mid.x,mid.y,r,0,6.2832,true); ctx.fillStyle='rgba(10,7,18,.55)'; ctx.fill(); ctx.restore();
+      pvRing(mid,r,'#43b0e8',null,3);
+      cap='Play area · '+cfg.areaR+' m radius';
+      sub=Math.round(cfg.areaR*2)+' m across — about '+paceText(cfg.areaR*2)+' from edge to edge. Everything happens inside this circle.';
+    }
+    if(mode==='zones'){
+      var plan=zonePlan(cfg), rng=mulberry32(20260808), cur={lat:centre.lat,lng:centre.lng,r:cfg.areaR};
+      pvRing(mid,cfg.areaR/mpp,'rgba(67,176,232,.85)',null,3);
+      for(var i=1;i<plan.length;i++){
+        cur=nextZone(rng,cur);
+        var sc=toScreen(cur), fade=0.25+0.6*(i/plan.length);
+        pvRing(sc,cur.r/mpp,'rgba(242,166,59,'+fade+')',[6,6],2);
+      }
+      var last=plan[plan.length-1];
+      cap='Zone · '+CFG.zoneStages+' moves down to '+Math.round(last)+' m';
+      sub=CFG.zoneStages? ('One possible run of circles. The final one is '+Math.round(last*2)+' m across ('+paceText(last*2)+') and could sit anywhere inside the first — you cannot camp the middle.')
+        : 'The circle never moves. The whole play area stays safe all match.';
+    }
+    if(mode==='catch'){
+      var base=cfg.catchRadius/mpp;
+      var eff=catchDistance({acc:25},{acc:25},cfg.catchRadius)/mpp;
+      if(cfg.gpsForgive) pvRing(mid,eff,'rgba(242,166,59,.55)',[5,5],2);
+      pvRing(mid,base,'#e8503a',null,3);
+      ctx.fillStyle='rgba(232,80,58,.10)'; ctx.beginPath(); ctx.arc(mid.x,mid.y,base,0,6.2832); ctx.fill();
+      var S=clamp(Math.round((1.8/mpp)/18),1,4);
+      drawChar(ctx,G.me.char,'E',0,S,mid.x-7*S,mid.y-18*S);
+      var tp=offsetLatLng(centre,cfg.catchRadius,0), ts=toScreen(tp);
+      drawChar(ctx,(G.me.char+4)%CHARS.length,'W',1,S,ts.x-7*S,ts.y-18*S);
+      ctx.strokeStyle='rgba(242,236,223,.7)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(mid.x,mid.y); ctx.lineTo(ts.x,ts.y); ctx.stroke(); ctx.setLineDash([]);
+      label((mid.x+ts.x)/2,mid.y-6,cfg.catchRadius+' m','#f2ecdf',10);
+      cap='Catch distance · '+cfg.catchRadius+' m';
+      sub='About '+carLengths(cfg.catchRadius).toFixed(1)+' car lengths, or '+Math.round(cfg.catchRadius/0.75)+' steps.'+
+        (cfg.gpsForgive?' The dashed ring is how far it can stretch when phone accuracy is poor.':' Strict: no allowance for GPS drift.');
+    }
+    if(mode==='run'){
+      var secs=extra.runSecs, d=runDistance(secs);
+      pvRing(mid,d/mpp,'#63c77c',[7,5],3);
+      pvRing(mid,(d*WALK/RUN)/mpp,'rgba(242,236,223,.35)',[3,5],2);
+      var S2=clamp(Math.round((1.8/mpp)/18),1,3);
+      drawChar(ctx,G.me.char,'S',0,S2,mid.x-7*S2,mid.y-18*S2);
+      cap=(PV.focus==='scatter'?'Head start':PV.focus==='fullSignal'?'Wrong-vote exposure':'Time to turn seeker')+' · '+mmss(secs);
+      sub='Green: how far someone running gets in that time ('+Math.round(d)+' m). Faint ring: walking pace ('+Math.round(d*WALK/RUN)+' m).'+
+        (PV.focus==='scatter'?' That is how much of the map hiders can reach before the hunt starts.':'');
+    }
+    if(mode==='signal'){
+      var unc=110*cfg.trackScale;
+      ctx.fillStyle='rgba(232,80,58,.14)'; ctx.beginPath(); ctx.arc(mid.x,mid.y,unc/mpp,0,6.2832); ctx.fill();
+      pvRing(mid,unc/mpp,'#e8503a',null,2);
+      var off=offsetLatLng(centre,unc*0.45,unc*0.3), os=toScreen(off);
+      var S3=clamp(Math.round((1.8/mpp)/18),1,3);
+      drawChar(ctx,G.me.char,'S',0,S3,os.x-7*S3,os.y-18*S3);
+      ctx.fillStyle='#e8503a'; ctx.fillRect(mid.x-3,mid.y-3,6,6);
+      cap='Seeker signal · about '+Math.round(unc)+' m';
+      sub='A mid-game blip only narrows you down to this circle — '+paceText(unc)+' from the middle to the edge. The seeker still has to search it.';
+    }
+    pvScaleBar(mpp);
+  });
+  var capEl=document.getElementById('setupCaption');
+  if(capEl){ capEl.firstElementChild.textContent=cap; capEl.lastElementChild.textContent=sub; }
+}
+function pvFocus(key,row){
+  PV.focus=key;
+  var body=document.getElementById('setupBody');
+  if(body) Array.prototype.forEach.call(body.querySelectorAll('.setrow'),function(r){r.classList.remove('focus');});
+  if(row) row.classList.add('focus');
+  drawPreview();
+}
+
+function rulesSummary(c){
+  c=c||G.st.cfg;
+  var bits=[Math.round(c.matchLen/60)+' min',c.areaR+' m area',mmss(c.scatter)+' head start',
+    c.catchRadius+' m catch',(c.imposters?'1 imposter':'no imposter'),
+    (c.tribunals?c.tribunals+' vote'+(c.tribunals>1?'s':''):'no votes'),
+    (c.zoneStages?c.zoneStages+' zone moves':'zone never moves')];
+  return bits.join(' · ');
+}
+
+/* ---------- boot ---------- */
+var PENDING_JOIN=null;   // a room from the join link, waiting on the profile flow
+function boot(){
+  G.me.id=uid();
+  // a join link carries the room and the connection, so a guest taps once and is in
+  var H=parseHash(location.hash);
+  if(H.mp) G.mp=H.mp;
+  initMap(); buildDev(); buildHowTo();
+  startGPS();
+  loadProfile().then(function(p){
+    if(p&&p.name){ G.me.name=p.name; G.me.char=p.char||0; $('#nameInput').value=p.name; }
+    if(p&&p.id) G.me.id=p.id;
+    if(!H.mp&&p&&validMp(p.mp)) G.mp=p.mp;
+    netRefresh();
+    buildCharGrid(); paintChar($('#charBig'),G.me.char,'S',0);
+    if(H.code){
+      $('#codeInput').value=H.code; PENDING_JOIN=H.code;
+      // straight in if we already know who they are, otherwise let them name
+      // themselves first — the code is picked up again after the safety screen
+      if(G.me.name){ PENDING_JOIN=null; joinGame(H.code); } else show('s-name');
+    }
+  });
+  setInterval(function(){ if(CUR==='s-diag')renderDiag(); if(CUR==='s-create')drawPreview(); if(CUR==='s-welcome')paintScene('welcomeScene'); if(CUR==='s-home')paintScene('homeScene'); if(CUR==='s-lobby')renderLobby(); },400);
+
+  $('#b-begin').onclick=function(){ SFX.tap(); ac(); show(G.me.name?'s-safety':'s-name'); };
+  $('#b-name-next').onclick=function(){
+    var v=($('#nameInput').value||'').trim().toUpperCase().slice(0,10);
+    if(!v){ $('#nameInput').focus(); return; }
+    G.me.name=v; saveProfile(); SFX.tap(); buildCharGrid(); paintChar($('#charBig'),G.me.char,'S',0); show('s-char');
+  };
+  $('#b-char-next').onclick=function(){ saveProfile(); SFX.ok(); show('s-safety'); };
+  $('#b-safety-ok').onclick=function(){ SFX.tap();
+    if(PENDING_JOIN){ var c=PENDING_JOIN; PENDING_JOIN=null; show('s-join'); joinGame(c); }
+    else show('s-home'); };
+  $('#segPreset').onclick=function(e){
+    var b=e.target.closest('button'); if(!b) return;
+    Array.prototype.forEach.call(this.children,function(c){c.classList.remove('on');});
+    b.classList.add('on'); SFX.tap();
+    var p=PRESETS[b.getAttribute('data-v')];
+    Object.keys(p).forEach(function(k){ G.cfg[k]=p[k]; });
+    buildSetup(); pvFocus('areaR');
+  };
+  $('#b-reset-rules').onclick=function(){
+    G.cfg={matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
+      fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,objectives:1,
+      gpsForgive:1,mapStyle:'real'};
+    buildSetup(); pvFocus('areaR'); SFX.ok();
+  };
+  $('#b-create').onclick=function(){ SFX.tap(); buildSetup();
+    if(G.pos) fetchStreets({lat:G.pos.lat,lng:G.pos.lng},Math.max(400,G.cfg.areaR+200),false);
+    $('#createLoc').textContent=G.gps==='ok'?'Using your current location as the centre of the play area.'
+      :(G.gps==='weak'?'GPS is weak here — the centre may be off by a few metres.'
+        :'Waiting for GPS — if it never arrives the game runs in simulated mode so you can still test.');
+    show('s-create'); };
+  $('#b-join').onclick=function(){ SFX.tap(); show('s-join'); };
+  $('#b-howto').onclick=function(){ SFX.tap(); show('s-howto'); };
+  $('#b-diag').onclick=function(){ SFX.tap(); renderDiag(); show('s-diag'); requestFix(); };
+  $('#b-diag-loc').onclick=function(){ SFX.tap(); requestFix(); };
+  $('#b-diag-map').onclick=function(){ SFX.tap();
+    var c=G.pos||DEFAULT_CENTRE; fetchStreets(c,Math.max(400,G.cfg.areaR+200),true); renderDiag(); };
+  $('#b-diag-clear').onclick=function(){
+    var c=G.pos||DEFAULT_CENTRE;
+    try{ if(window.storage) window.storage.delete(streetsCacheKey(c,Math.max(400,G.cfg.areaR+200)),false); }catch(e){}
+    STREETS={status:'idle',ways:[],centre:null,radius:0,err:null,at:0,graph:null,source:null};
+    TILE.cache={}; TILE.loaded=0; TILE.fails=0; TILE.on=true; SFX.tap(); renderDiag(); };
+  $('#b-profile').onclick=function(){ SFX.tap(); buildCharGrid(); show('s-char'); };
+  $('#b-mp').onclick=function(){ SFX.tap(); renderMpScreen(); show('s-mp'); };
+  $('#b-mp-save').onclick=function(){ SFX.tap(); saveMp(); };
+  $('#b-mp-clear').onclick=function(){ G.mp=null; $('#mpUrl').value=''; $('#mpKey').value='';
+    $('#mpMsg').textContent=''; netRefresh(); saveProfile(); SFX.tap(); renderMpScreen(); };
+  $('#b-copy-link').onclick=function(){
+    var t=G.joinLink||''; SFX.tap();
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(t).then(function(){toast('Join link copied');},
+        function(){toast('Copy failed — long-press the link to select it');});
+    } else toast('Long-press the link to select and copy it');
+  };
+  $('#b-solo').onclick=function(){ SFX.ok(); G.cfg.matchLen=1200; G.cfg.scatter=60; createGame(true); };
+  $$('[data-back]').forEach(function(b){ b.onclick=function(){ SFX.tap(); show(b.getAttribute('data-back')); }; });
+  $('#b-create-go').onclick=function(){ SFX.ok(); createGame(false); };
+  $('#b-join-go').onclick=function(){
+    var c=($('#codeInput').value||'').trim().toUpperCase();
+    if(c.length<4){ $('#joinMsg').textContent='Enter the 5-character code.'; return; }
+    joinGame(c);
+  };
+  $('#b-start').onclick=function(){ SFX.ok(); act('start'); };
+  $('#b-leave').onclick=function(){ leaveRoom(); show('s-home'); };
+  $('#b-role-ok').onclick=function(){ SFX.tap(); show('s-match'); resizeMap(); };
+  $('#b-vote-lock').onclick=function(){ if(!myVote)return; act('vote',myVote); SFX.ok();
+    $('#b-vote-lock').textContent='Vote locked'; $('#b-vote-lock').disabled=true; };
+  $('#b-vote-skip').onclick=function(){ act('vote','skip'); SFX.tap();
+    $('#b-vote-lock').textContent='Skipped'; $('#b-vote-lock').disabled=true; };
+  $('#b-again').onclick=function(){ SFX.tap(); G.bots=[]; createGame(G.mode==='solo'); };
+  $('#b-home').onclick=function(){ leaveRoom(); SFX.tap(); show('s-home'); };
+  $('#devtab').onclick=function(){ $('#dev').classList.toggle('show'); };
+  $('#codeInput').addEventListener('input',function(){ this.value=this.value.toUpperCase(); });
+
+  logicTick(); netLoop(); requestAnimationFrame(frame);
+  paintScene('welcomeScene');
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot); else boot();
+})();

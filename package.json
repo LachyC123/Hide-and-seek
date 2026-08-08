@@ -1,0 +1,14 @@
+{
+  "name": "false-safe",
+  "version": "0.4.0",
+  "private": true,
+  "description": "FALSE SAFE — real-world pixel-art manhunt with a hidden imposter",
+  "scripts": {
+    "build": "node build.js",
+    "test:core": "node test/harness.js",
+    "test:smoke": "node build.js && node test/smoke.js && node test/smoke2.js && node test/smoke3.js && node test/smoke4.js && node test/smoke5.js && node test/smoke6.js && node test/smoke7.js",
+    "test": "npm run test:core && npm run test:smoke",
+    "serve": "node build.js && node -e \"const h=require('http'),f=require('fs');h.createServer((q,s)=>{s.writeHead(200,{'Content-Type':'text/html'});s.end(f.readFileSync('index.html'))}).listen(8080,()=>console.log('http://localhost:8080 — GPS works on localhost'))\""
+  },
+  "devDependencies": { "jsdom": "^24.0.0" }
+}
