@@ -779,6 +779,18 @@ function gpsQuality(acc){
   if(acc<=CFG.maxAcc) return {label:'WEAK',level:1};
   return {label:'POOR',level:0};
 }
+/* ---- built-in room connection ----
+   Fill these in to make the deployed page work for everyone with no setup screen
+   and no join link. Both values are public by design: the anon key is meant to ship
+   inside client apps. What it is NOT is a secret that hides anything — with the
+   policies in MP_SQL, anyone holding these can read any room, and a room contains
+   who the imposter is. Leave blank to require the setup screen or a join link.
+   NEVER put the service_role key here. It bypasses every policy. */
+var MP_DEFAULT={
+  url:'https://acyepauwpqocbxvrqlcs.supabase.co',
+  key:'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFjeWVwYXV3cHFvY2J4dnJxbGNzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU2OTQzMDYsImV4cCI6MjEwMTI3MDMwNn0.KydC1wavzls4ovg_YyP7Nk1dv2x5rfZdShBigxhKFa4'
+};
+
 /* --- multiplayer plumbing -----------------------------------------------
    The host is authoritative. Clients write one input row each and read the
    room state back. Everything below is the part of that exchange that can be
@@ -852,7 +864,7 @@ function supaRequest(mp,path,opts){
   // PostgREST answer 204 with no body, which silently empties every read.
   if(opts.prefer) h.Prefer=opts.prefer;
   return {
-    url:mp.url.replace(/\/+$/,'')+'/rest/v1/'+path,
+    url:normaliseMpUrl(mp.url)+'/rest/v1/'+path,
     method:opts.method||'GET',
     headers:h,
     body:opts.body===undefined?undefined:JSON.stringify(opts.body)
@@ -926,20 +938,29 @@ function supaErrorText(status,body){
     return 'The project rejected the key. Check you pasted the anon public key, not the service_role one.';
   return 'HTTP '+status+(body?' — '+body.slice(0,140):'');
 }
+/* The dashboard shows the REST endpoint more prominently than the bare project URL,
+   so that is what people copy. Take either, and quietly drop any API path off the end
+   rather than rejecting a value that is only cosmetically wrong. */
+function normaliseMpUrl(u){
+  if(typeof u!=='string') return '';
+  return u.trim().replace(/\/+$/,'')
+    .replace(/\/(rest|auth|storage|realtime|graphql|functions)\/v\d+$/i,'')
+    .replace(/\/+$/,'');
+}
 function validMp(mp){
-  return !!(mp&&typeof mp.url==='string'&&/^https:\/\/[^\s\/]+\.[^\s\/]+$/.test(mp.url.replace(/\/+$/,''))&&
+  return !!(mp&&typeof mp.url==='string'&&/^https:\/\/[^\s\/]+\.[^\s\/]+$/.test(normaliseMpUrl(mp.url))&&
             typeof mp.key==='string'&&mp.key.length>=20);
 }
 /* The anon key is public by design, so the join link can carry the whole
    connection — a guest opens one URL and never sees a settings screen. */
 function encodeMpConfig(mp){
   if(!validMp(mp)) return '';
-  return encodeURIComponent(mp.url.replace(/\/+$/,''))+'~'+encodeURIComponent(mp.key);
+  return encodeURIComponent(normaliseMpUrl(mp.url))+'~'+encodeURIComponent(mp.key);
 }
 function decodeMpConfig(s){
   if(!s||s.indexOf('~')<0) return null;
   var i=s.indexOf('~'),mp;
-  try{ mp={url:decodeURIComponent(s.slice(0,i)).replace(/\/+$/,''),key:decodeURIComponent(s.slice(i+1))}; }
+  try{ mp={url:normaliseMpUrl(decodeURIComponent(s.slice(0,i))),key:decodeURIComponent(s.slice(i+1))}; }
   catch(e){ return null; }
   return validMp(mp)?mp:null;
 }
@@ -1186,7 +1207,7 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   presence:presence,presentVoters:presentVoters,lostHiders:lostHiders,hostAlive:hostAlive,
   supaRequest:supaRequest,rpcFor:rpcFor,supaErrorText:supaErrorText,MP_SQL:MP_SQL,
   validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
-  parseHash:parseHash,buildJoinLink:buildJoinLink,
+  parseHash:parseHash,buildJoinLink:buildJoinLink,normaliseMpUrl:normaliseMpUrl,MP_DEFAULT:MP_DEFAULT,
   walkMins:walkMins,runDistance:runDistance,carLengths:carLengths,paceText:paceText,
   zonePlan:zonePlan,previewMpp:previewMpp,scaleBarFor:scaleBarFor,
   lon2tile:lon2tile,lat2tile:lat2tile,tile2lon:tile2lon,tile2lat:tile2lat,tileMpp:tileMpp,zoomForMpp:zoomForMpp};
@@ -1327,19 +1348,10 @@ function sget(k){ if(!hasStore()) return Promise.reject('nostore');
 function slist(prefix){ if(!hasStore()) return Promise.resolve([]);
   return window.storage.list(prefix,true).then(function(r){return (r&&r.keys)||[];}).catch(function(){return [];}); }
 
-/* ---- built-in room connection ----
-   Fill these in to make the deployed page work for everyone with no setup screen
-   and no join link. Both values are public by design: the anon key is meant to ship
-   inside client apps. What it is NOT is a secret that hides anything — with the
-   policies in MP_SQL, anyone holding these can read any room, and a room contains
-   who the imposter is. Leave blank to require the setup screen or a join link.
-   NEVER put the service_role key here. It bypasses every policy. */
-var MP_DEFAULT={url:'',key:''};
-
 var NET={kind:'none',mp:null,lastErr:null,ok:0,fails:0,lastOkAt:0};
 function mpFallback(saved){
   if(validMp(saved)) return saved;
-  if(validMp(MP_DEFAULT)) return {url:MP_DEFAULT.url.replace(/\/+$/,''),key:MP_DEFAULT.key};
+  if(validMp(MP_DEFAULT)) return {url:normaliseMpUrl(MP_DEFAULT.url),key:MP_DEFAULT.key};
   return null;
 }
 function usingBuiltInMp(){
@@ -1362,10 +1374,17 @@ function netNote(e){
 }
 function netGood(v){ NET.ok++; NET.lastOkAt=now(); G.netErr=0; return v; }
 
+/* Must never throw synchronously. Every caller does netSomething().then(...), and a
+   synchronous throw skips the .catch entirely: createGame aborts half way through, and
+   netLoop leaves netBusy stuck true so the room never syncs again. */
 function supaCall(path,opts){
-  var r=supaRequest(NET.mp,path,opts);
-  return fetch(r.url,{method:r.method,headers:r.headers,body:r.body,cache:'no-store'})
-    .then(function(res){
+  var r,p;
+  try{
+    r=supaRequest(NET.mp,path,opts);
+    if(typeof fetch!=='function') throw new Error('this browser cannot make network requests');
+    p=fetch(r.url,{method:r.method,headers:r.headers,body:r.body,cache:'no-store'});
+  }catch(e){ return Promise.reject(e); }
+  return p.then(function(res){
       if(!res.ok) return res.text().then(function(t){
         throw new Error(supaErrorText(res.status,t));
       });
@@ -1907,8 +1926,12 @@ function netLoop(){
   var n=now(), iv=G.isHost?CFG.syncHost:CFG.syncClient;
   if(G.mode==='net'&&G.code&&G.st&&!G.netBusy&&(G.flush||n-G.lastPush>=iv)){
     G.lastPush=n; G.flush=false; G.netBusy=true;
-    var job=G.isHost?pullInputs().then(pushState):pushInput().then(pullState);
-    job.catch(netFail).then(function(){G.netBusy=false;},function(){G.netBusy=false;});
+    var job;
+    // a throw here rather than a rejection would leave netBusy true forever
+    try{ job=G.isHost?pullInputs().then(pushState):pushInput().then(pullState); }
+    catch(e){ job=Promise.reject(e); }
+    var release=function(){ G.netBusy=false; };
+    job.catch(netFail).then(release,release);
   }
   setTimeout(netLoop,250);
 }
@@ -2255,7 +2278,7 @@ function renderMpScreen(){
 function saveMp(){
   var url=($('#mpUrl').value||'').trim(), key=($('#mpKey').value||'').trim();
   var msg=$('#mpMsg');
-  var mp={url:url.replace(/\/+$/,''),key:key};
+  var mp={url:normaliseMpUrl(url),key:key};
   if(!validMp(mp)){
     msg.textContent='That does not look right — the URL must start with https:// and the anon key is a long token.';
     SFX.bad(); return;

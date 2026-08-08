@@ -728,6 +728,30 @@ t('an http URL or a stub key is refused',()=>
   ok(!C.validMp({url:'http://abc.supabase.co',key:MP.key})&&
      !C.validMp({url:'https://abc.supabase.co',key:'short'})&&
      !C.validMp(null)&&!C.validMp({})));
+t('the REST endpoint is accepted as the project URL',()=>{
+  // the dashboard shows this one more prominently than the bare project URL
+  const mp={url:'https://abc.supabase.co/rest/v1/',key:MP.key};
+  return ok(C.validMp(mp)&&
+    C.supaRequest(mp,'rpc/fs_rpc').url==='https://abc.supabase.co/rest/v1/rpc/fs_rpc');});
+t('any of the other API paths are trimmed off too',()=>
+  ok(C.normaliseMpUrl('https://a.supabase.co/auth/v1')==='https://a.supabase.co'&&
+     C.normaliseMpUrl('https://a.supabase.co/storage/v1/')==='https://a.supabase.co'&&
+     C.normaliseMpUrl('https://a.supabase.co/functions/v2')==='https://a.supabase.co'));
+t('surrounding whitespace from a sloppy copy is forgiven',()=>
+  eq(C.normaliseMpUrl('  https://a.supabase.co/rest/v1/  '),'https://a.supabase.co'));
+t('a tidy project URL is left exactly as it is',()=>
+  eq(C.normaliseMpUrl('https://a.supabase.co'),'https://a.supabase.co'));
+t('a join link built from a REST endpoint still connects',()=>{
+  const link=C.buildJoinLink('https://x.io/','ABCDE',{url:'https://a.supabase.co/rest/v1/',key:MP.key});
+  return eq(C.parseHash(link).mp.url,'https://a.supabase.co');});
+t('the built-in connection, if there is one, is usable',()=>{
+  // an unusable MP_DEFAULT would ship a page that looks connected and is not
+  const d=C.MP_DEFAULT;
+  if(!d||!(d.url||d.key)) return true;                       // left blank on purpose
+  if(!C.validMp(d)) throw new Error('MP_DEFAULT is filled in but not valid');
+  if(/service_role/.test(d.key)) throw new Error('MP_DEFAULT holds a service_role key');
+  const role=JSON.parse(Buffer.from(d.key.split('.')[1],'base64').toString()).role;
+  return eq(role,'anon','baked-in key role:');});
 
 t('a blank built-in connection is not mistaken for a real one',()=>
   ok(!C.validMp({url:'',key:''})));

@@ -91,9 +91,10 @@ This is the same text the game shows on its Multiplayer setup screen and writes 
 client ever sends an operation this block has no branch for.
 </details>
 
-To skip step 4 for everybody forever, put the same two values in `MP_DEFAULT` at the top of
-`src/game.js` and rebuild. Then the deployed link is already connected and players only ever
-type a room code.
+Steps 1-4 are already done for this repo: `MP_DEFAULT` in `src/game.js` holds the project the
+deployed page uses, so players only ever type a room code. Point it at your own project by
+replacing those two values and rebuilding; the setup screen still overrides it per device, and a
+join link overrides both.
 
 ### What the anon key does and does not protect
 
@@ -124,7 +125,7 @@ can join.
 ```bash
 npm install
 npm run serve     # http://localhost:8080 — GPS works on localhost
-npm test          # 204 logic tests + 7 browser-simulated runs
+npm test          # 210 logic tests + 7 browser-simulated runs
 ```
 
 `test/smoke7.js` is worth knowing about: it boots the real built file in two windows against a

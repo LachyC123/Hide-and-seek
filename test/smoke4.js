@@ -4,6 +4,8 @@ const errors=[];const dom=new JSDOM(html,{runScripts:'dangerously',pretendToBeVi
 const w=dom.window;w.addEventListener('error',e=>errors.push(e.message));
 const stub=new Proxy({},{get:(t,k)=>k==='measureText'?(()=>({width:20})):(()=>{})});
 w.HTMLCanvasElement.prototype.getContext=()=>stub;w.requestAnimationFrame=()=>0;
+// no network at all: the room cannot be published, and the app must survive that
+w.fetch=()=>Promise.reject(new Error('offline'));
 w.Image=class{set src(v){setTimeout(()=>this.onerror&&this.onerror(),1);}};
 w.navigator.geolocation={watchPosition:ok=>{ok({coords:{latitude:-33.8688,longitude:151.2093,accuracy:9}});
   setTimeout(()=>ok({coords:{latitude:-33.8688,longitude:151.2093,accuracy:11}}),200);return 1;}};
