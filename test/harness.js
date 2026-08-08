@@ -1040,6 +1040,63 @@ t('poor accuracy widens the reach rather than blocking the catch',()=>{
   const r=C.catchStatus(csSeeker({acc:45}),{h:csHider(35,{acc:45})},now,20);
   return ok(r.ok,'reach was only '+r.reach+' for '+r.dist+' m');});
 
+/* ---- dead reckoning ---- */
+t('two fixes a second apart give the speed and direction between them',()=>{
+  const a={lat:O.lat,lng:O.lng}, b=C.offsetLatLng(O,3,0);
+  const v=C.velocityFrom(a,{lat:b.lat,lng:b.lng},1);
+  return ok(Math.abs(v.vE-3)<0.2&&Math.abs(v.vN)<0.2,'got '+v.vE+','+v.vN);});
+t('a GPS jump cannot imply a speed no human has',()=>{
+  const b=C.offsetLatLng(O,500,0);
+  const v=C.velocityFrom({lat:O.lat,lng:O.lng},{lat:b.lat,lng:b.lng},1);
+  return ok(Math.sqrt(v.vE*v.vE+v.vN*v.vN)<=C.CFG.maxSpeed+0.01);});
+t('standing still implies no velocity at all',()=>{
+  const v=C.velocityFrom({lat:O.lat,lng:O.lng},{lat:O.lat,lng:O.lng},1);
+  return ok(v.vE===0&&v.vN===0);});
+t('junk inputs imply no velocity rather than NaN',()=>{
+  const v=C.velocityFrom(null,{lat:O.lat,lng:O.lng},0);
+  return ok(v.vE===0&&v.vN===0);});
+t('a runner is drawn where they are now, not where they were two seconds ago',()=>{
+  const p={lat:O.lat,lng:O.lng,locT:1000,vE:3,vN:0};
+  const q=C.predictPos(p,3000);
+  return ok(Math.abs(C.metersBetween(p,q)-6)<0.5,'carried '+C.metersBetween(p,q)+' m');});
+t('prediction stops after a few seconds rather than sailing on forever',()=>{
+  const p={lat:O.lat,lng:O.lng,locT:0,vE:3,vN:0};
+  return ok(C.metersBetween(p,C.predictPos(p,60000))<=9.5);});
+t('a player with no velocity is left exactly where they reported',()=>{
+  const p={lat:O.lat,lng:O.lng,locT:0};
+  const q=C.predictPos(p,5000);
+  return ok(q.lat===p.lat&&q.lng===p.lng);});
+
+/* ---- the host judging a catch it saw with older eyes ---- */
+const juSeeker=(over)=>Object.assign({id:'s',role:'seeker',caught:false,
+  lat:O.lat,lng:O.lng,locT:now,acc:8},over||{});
+const juHider=(m,over)=>{const p=C.offsetLatLng(O,m,0);
+  return Object.assign({id:'h',role:'hider',caught:false,lat:p.lat,lng:p.lng,locT:now,acc:8},over||{});};
+t('a clean catch is accepted exactly as before',()=>
+  ok(C.catchAccept(juSeeker(),juHider(5),now)));
+t('data one sync stale on the host still lands the catch the seeker saw',()=>
+  ok(C.catchAccept(juSeeker({locT:now-(C.CFG.locFresh+15)*1000}),
+                   juHider(5,{locT:now-(C.CFG.locFresh+15)*1000}),now)));
+t('slightly beyond reach is forgiven, because the target has moved since',()=>{
+  const reach=C.catchDistance({acc:8},{acc:8});
+  return ok(C.catchAccept(juSeeker(),juHider(reach*1.4),now));});
+t('double the reach is a miss however you squint',()=>{
+  const reach=C.catchDistance({acc:8},{acc:8});
+  return ok(!C.catchAccept(juSeeker(),juHider(reach*2.2),now));});
+t('truly dead data is not enough to take someone out',()=>
+  ok(!C.catchAccept(juSeeker(),juHider(5,{locT:now-C.CFG.locFresh*3000}),now)));
+t('leniency never lets a seeker catch a seeker or a caught player',()=>
+  ok(!C.catchAccept(juSeeker(),juHider(5,{role:'seeker'}),now)&&
+     !C.catchAccept(juSeeker(),juHider(5,{caught:true}),now)));
+
+/* ---- the catch note is not a rangefinder ---- */
+t('a hider just out of reach is named with a distance',()=>{
+  const r=C.catchStatus(csSeeker(),{h:csHider(45)},now,20);
+  return ok(r.why==='far'&&r.reveal===true);});
+t('a hider far away is not, or the note is a tracking device',()=>{
+  const r=C.catchStatus(csSeeker(),{h:csHider(300)},now,20);
+  return ok(r.why==='far'&&r.reveal===false);});
+
 /* ---- leaving the circle ---- */
 const zone={lat:O.lat,lng:O.lng,r:100};
 const outsideAt=(m,since)=>{const p=C.offsetLatLng(O,m,0);

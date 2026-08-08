@@ -783,8 +783,45 @@ function catchStatus(seeker,players,nowMs,radius){
   var out={target:best.target,dist:best.dist,reach:reach,ok:false,why:''};
   if(!seeker.locT||nowMs-seeker.locT>CFG.locFresh*1000){ out.why='you'; return out; }
   if(!best.target.locT||nowMs-best.target.locT>CFG.locFresh*1000){ out.why='them'; return out; }
+  out.reveal=best.dist<=Math.max(60,reach*1.5);
   if(best.dist>reach){ out.why='far'; return out; }
   out.ok=true; return out;
+}
+
+/* --- dead reckoning ---------------------------------------------------
+   A position crosses the network in one to two sync beats each way, so what one
+   phone knows about another is ~3 seconds old — 10 m at running speed, which is
+   most of the "the map is inaccurate" complaint. Remember the velocity each fix
+   implies and carry the marker forward, capped so one bad fix cannot fling anyone. */
+function velocityFrom(prev,next,dtSec){
+  if(!prev||!next||prev.lat==null||next.lat==null||!(dtSec>0)) return {vE:0,vN:0};
+  var d=metersBetween(prev,next);
+  if(!(d>0.5)) return {vE:0,vN:0};
+  var b=dirTo2(prev,next), sp=Math.min(d/dtSec,CFG.maxSpeed);
+  return {vE:b.x*sp,vN:b.y*sp};
+}
+function predictPos(p,nowMs,maxAheadSec){
+  if(!p||p.lat==null) return p;
+  var vE=p.vE||0,vN=p.vN||0;
+  if(!vE&&!vN) return {lat:p.lat,lng:p.lng};
+  var age=Math.max(0,(nowMs-(p.locT||0))/1000);
+  var t=Math.min(age,maxAheadSec===undefined?3:maxAheadSec);
+  return offsetLatLng(p,vE*t,vN*t);
+}
+
+/* The host judges a catch with data one sync older than what the seeker's own
+   screen verified a moment ago. Refusing what the seeker saw — silently — was the
+   worst failure this game had: button pressed, nothing happens, nobody told why.
+   So the host allows for its own staleness, and a genuine refusal answers back. */
+function catchAccept(seeker,target,nowMs){
+  if(canCatch(seeker,target,nowMs)) return true;
+  if(!seeker||!target||seeker.id===target.id) return false;
+  if(seeker.role!=='seeker'||seeker.converting||seeker.caught) return false;
+  if(target.role==='seeker'||target.caught) return false;
+  if(!seeker.locT||!target.locT) return false;
+  var fresh=CFG.locFresh*2000;                    // twice the normal freshness window
+  if(nowMs-seeker.locT>fresh||nowMs-target.locT>fresh) return false;
+  return metersBetween(seeker,target)<=catchDistance(seeker,target)*1.6;
 }
 
 /* --- voting ----------------------------------------------------------- */
@@ -990,6 +1027,9 @@ function mergePlayerInput(p,inp,nowMs){
     // comparing a phone's timestamp against the host's clock means two phones that
     // disagree about the time refuse every legitimate tag.
     var age=Math.max(0,(inp.ts||inp.locT||0)-(inp.locT||0));
+    var dtS=(p.locSrc&&inp.locT>p.locSrc)?(inp.locT-p.locSrc)/1000:0;
+    var vel=(dtS>0.3&&dtS<10)?velocityFrom(p,inp,dtS):{vE:0,vN:0};
+    p.vE=vel.vE; p.vN=vel.vN;
     p.lat=inp.lat; p.lng=inp.lng; p.acc=inp.acc;
     p.locSrc=inp.locT;                 // sender's clock, only ever compared to itself
     p.locT=nowMs-age;                  // our clock, which is what freshness is checked against
@@ -1659,7 +1699,8 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,volunteerIds:volunteerIds,nextZone:nextZone,
   zoneContains:zoneContains,zoneStageTimes:zoneStageTimes,trackingBand:trackingBand,makeBlip:makeBlip,
   signalGap:signalGap,sees:sees,nearestSeeker:nearestSeeker,
-  canCatch:canCatch,catchStatus:catchStatus,zoneVerdict:zoneVerdict,
+  canCatch:canCatch,catchAccept:catchAccept,catchStatus:catchStatus,zoneVerdict:zoneVerdict,
+  velocityFrom:velocityFrom,predictPos:predictPos,
   fixAge:fixAge,isStale:isStale,rejoinSlot:rejoinSlot,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
   factionCounts:factionCounts,checkWin:checkWin,outsideState:outsideState,pickMission:pickMission,
   missionTick:missionTick,missionTarget:missionTarget,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
@@ -2264,12 +2305,15 @@ function applyAction(st,pid,a){
   var p=st.players[pid]; if(!p) return;
   if(a.type==='catch'){
     var tgt=st.players[a.data];
-    if(tgt&&canCatch(p,tgt,now())){
+    if(tgt&&catchAccept(p,tgt,now())){
       tgt.caught=true; tgt.convertAt=now()+CFG.conversion*1000; tgt.outsideSince=null;
       p.stats.catches++;
       pushEvent(st,'all','caught','HIDER CAUGHT',tgt.name+' has been caught by '+p.name+'.');
       pushEvent(st,tgt.id,'you-caught','CAUGHT!',"You're joining the hunt.");
       var w=checkWin(st); if(w) endMatch(st,w);
+    } else if(tgt&&!tgt.caught){
+      pushEvent(st,pid,'miss','THAT ONE DIDN\'T COUNT',
+        tgt.name+' had moved by the time your catch arrived. If you really tagged them, use \u201cI caught someone\u201d.');
     }
   }
   if(a.type==='claim'&&p.role==='seeker'&&!p.caught){
@@ -2407,6 +2451,7 @@ function pushInput(){
   var p={id:G.me.id,name:G.me.name,char:G.me.char,seq:G.seq,
     lat:G.pos?G.pos.lat:null,lng:G.pos?G.pos.lng:null,locT:G.pos?G.pos.t:0,acc:G.pos?G.pos.acc:null,
     actions:pending.slice(-24),ts:now()};
+  if(G.pos) G._pushedPos={lat:G.pos.lat,lng:G.pos.lng};
   return netPutInput(G.code,G.me.id,p);
 }
 function pullInputs(){
@@ -2452,6 +2497,7 @@ function pullInputs(){
 }
 function pushState(){
   if(!G.isHost||G.mode!=='net'||!G.st) return Promise.resolve();
+  if(G.pos) G._pushedPos={lat:G.pos.lat,lng:G.pos.lng};
   G.st.ver++; G.st.hostAt=now();
   return netPutState(G.code,G.st);
 }
@@ -2499,9 +2545,15 @@ function netStatus(){
   return {s:'ok',t:'Synced'};
 }
 
+function movedSincePush(){
+  if(!G.pos) return false;
+  if(!G._pushedPos) return true;
+  return metersBetween(G._pushedPos,G.pos)>12;
+}
 function netLoop(){
   var n=now(), iv=G.isHost?CFG.syncHost:CFG.syncClient;
-  if(G.mode==='net'&&G.code&&G.st&&!G.netBusy&&(G.flush||n-G.lastPush>=iv)){
+  if(G.mode==='net'&&G.code&&G.st&&!G.netBusy&&
+     (G.flush||n-G.lastPush>=iv||(movedSincePush()&&n-G.lastPush>=600))){
     G.lastPush=n; G.flush=false; G.netBusy=true;
     var job;
     // a throw here rather than a rejection would leave netBusy true forever
@@ -2632,6 +2684,9 @@ function pushLocalPos(){
   p.online=now();                                   // the host is never "dropped"
   if(!G.pos) return;
   if(p.lat!=null) p.stats.dist+=metersBetween(p,G.pos);
+  var dtS=(p.locT&&G.pos.t>p.locT)?(G.pos.t-p.locT)/1000:0;
+  if(dtS>0.3&&dtS<10){ var v=velocityFrom(p,G.pos,dtS); p.vE=v.vE; p.vN=v.vN; }
+  else if(dtS>=10){ p.vE=0; p.vN=0; }
   p.lat=G.pos.lat;p.lng=G.pos.lng;p.locT=G.pos.t;p.acc=G.pos.acc;
 }
 
@@ -2867,7 +2922,11 @@ function drawPlayers(st){
   ids.forEach(function(id){
     var p=st.players[id]; if(p.lat==null) return;
     if(!visibleTo(mine,p,st)) return;
-    var tp=(id===G.me.id&&G.pos)?G.pos:p;
+    // your own marker uses your own live fix; everyone else is dead-reckoned a
+    // moment ahead so runners stop being drawn where they were three seconds ago
+    var tp=(id===G.me.id&&G.pos)?G.pos
+      :(!isStale(p,now())&&(p.vE||p.vN))?predictPos(p,now(),3)
+      :p;
     var r=G.render[id]||(G.render[id]={lat:tp.lat,lng:tp.lng,dir:'S',frame:0,ft:0,moving:false});
     var moved=metersBetween(r,tp);
     r.lat+=(tp.lat-r.lat)*0.16; r.lng+=(tp.lng-r.lng)*0.16;
@@ -3240,10 +3299,11 @@ function updateHUD(){
   } else if(now()<st.fullSignalUntil&&p.role==='seeker'){
     ttl='Full signal'; txt='All hiders are visible for '+Math.ceil((st.fullSignalUntil-now())/1000)+'s. Go!';
   } else if(p.outsideSince){
-    var os=outsideState(p,lerpZone(st),now());
+    var zv=zoneVerdict(p,lerpZone(st),now());
     ttl='Outside safe zone';
-    txt=os.level===0?'Get back inside! '+Math.ceil(os.grace||0)+'s before the seekers start picking you up.'
-      :'The seekers are picking up your signal. Get back inside the circle.';
+    txt=CFG.zoneOut<0
+      ? 'The seekers can see you out here. Get back inside the circle.'
+      : 'GET BACK INSIDE \u2014 '+Math.ceil(zv.left==null?0:zv.left)+'s or you are OUT.';
     mood('zone');
   } else if(p.id===st.imposterId&&st.imposterEligible&&st.mission){
     var m=st.mission, tgt=missionTarget(st);
@@ -3296,8 +3356,10 @@ function updateHUD(){
         cs.why==='none'?'Nobody left to catch.'
         :cs.why==='you'?'Waiting for your own GPS — stand still for a moment.'
         :cs.why==='them'?(cs.target.name+"'s phone hasn't reported for a while. Use “I caught someone”.")
-        :cs.why==='far'?(cs.target.name+' is about '+Math.round(cs.dist)+' m away — get within '+
-                         Math.round(cs.reach)+' m.')
+        :cs.why==='far'?(cs.reveal
+            ?(cs.target.name+' is about '+Math.round(cs.dist)+' m away — get within '+
+              Math.round(cs.reach)+' m.')
+            :'No hider within reach. Follow the blips.')
         :'';
     }
     mb.classList.remove('hidden');

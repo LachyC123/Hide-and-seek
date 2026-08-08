@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  347 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  362 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -111,6 +111,18 @@ Break any of these and the game stops making sense:
   apart while their owners are touching, which is why `catchRadius` defaults to 20 and `locFresh`
   to 45 s. `catchStatus` exists so a seeker is never just told nothing: it names the nearest
   hider and why the button is missing.
+- Positions cross the network in one to two sync beats each way, so what one phone knows of
+  another is ~3 s old — most of "the map is inaccurate". Markers are dead-reckoned forward by
+  the last fix's velocity (`predictPos`, capped at 3 s and `maxSpeed`); stale players are never
+  predicted, and catches are judged on reported positions, not predicted ones.
+- The host judges a catch with data one sync older than the seeker's screen verified, so
+  `catchAccept` allows 1.6x the reach and twice the freshness — and a genuine refusal answers
+  with a MISS event. A pressed catch button that silently does nothing is the worst failure the
+  game has had, twice.
+- `catchStatus` names a hider and their distance only inside `reveal` range; beyond that the
+  note stays generic, or it becomes a rangefinder pointed at whoever is nearest.
+- A runner's position is pushed as soon as it has moved ~12 m (`movedSincePush`), not at the
+  next beat.
 - **The manual catch (`claim`) is the guarantee and takes no distance or freshness check.** A
   seeker saying "I tagged them" outranks the satellites; without it the game has a failure mode
   where nothing works and nobody can do anything about it.
@@ -207,7 +219,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           347 core tests + 7 smoke runs
+npm test           362 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 
