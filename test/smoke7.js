@@ -48,6 +48,19 @@ const FUNCTIONS={
     }
   }
 };
+/* When this is on, the fake project only has the older seven-function schema —
+   exactly what someone who ran the first version of the SQL is left with. */
+let LEGACY_ONLY=false;
+const seenFns=new Set();
+const LEGACY={
+  fs_put_room:a=>FUNCTIONS.fs_rpc({op:'put_room',room:a.p_code,body:a.p_state}),
+  fs_get_room:a=>FUNCTIONS.fs_rpc({op:'get_room',room:a.p_code}),
+  fs_drop_room:a=>FUNCTIONS.fs_rpc({op:'drop_room',room:a.p_code}),
+  fs_put_input:a=>FUNCTIONS.fs_rpc({op:'put_input',room:a.p_code,pid:a.p_player,body:a.p_input}),
+  fs_list_inputs:a=>FUNCTIONS.fs_rpc({op:'list_inputs',room:a.p_code}),
+  fs_clear_inputs:a=>FUNCTIONS.fs_rpc({op:'clear_inputs',room:a.p_code}),
+  fs_drop_input:a=>FUNCTIONS.fs_rpc({op:'drop_input',room:a.p_code,pid:a.p_player})
+};
 let tableHits=0;
 function backend(url,opts){
   calls++;
@@ -56,8 +69,11 @@ function backend(url,opts){
   if(h.apikey!==KEY||h.Authorization!=='Bearer '+KEY){ badAuth++; return res(401,{message:'bad key'}); }
   const rest=url.slice((PROJECT+'/rest/v1/').length);
   if(rest.indexOf('rpc/')!==0){ tableHits++; return res(401,{message:'permission denied for table'}); }
-  const fn=rest.slice(4).split('?')[0], impl=FUNCTIONS[fn];
-  if(!impl) return res(404,{code:'PGRST202',message:'could not find function '+fn});
+  const fn=rest.slice(4).split('?')[0];
+  seenFns.add(fn);
+  const table=LEGACY_ONLY?LEGACY:FUNCTIONS;
+  const impl=table[fn];
+  if(!impl) return res(404,{code:'PGRST202',message:'could not find function '+fn+' in the schema cache'});
   if((opts.method||'GET')!=='POST') return res(405,{message:'rpc needs POST'});
   // Prefer: return=minimal on an RPC would blank the body — the client must not send it
   if(h.Prefer&&/return=minimal/.test(h.Prefer)) return res(204,null);
@@ -127,6 +143,9 @@ function profile(P,name){
 function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); }
 
 (async function run(){
+  // Anyone who ran the first version of the SQL has the seven-function schema and no
+  // fs_rpc. That must play, not send them back to the SQL editor.
+  LEGACY_ONLY=true;
   const guestDisk=makeStore();                     // the guest's phone keeps its profile
   const HOST=makeWindow('host','#mp='+MP,makeStore());
   const GUEST=makeWindow('guest','#mp='+MP,guestDisk);
@@ -145,7 +164,7 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
     await waitFor('the host to open a lobby',()=>HOST.screen()==='s-lobby');
     const code=HOST.text('#lobbyCode');
     if(!/^[A-Z0-9]{5}$/.test(code)) throw new Error('host handed out a junk code: '+code);
-    log.push('host created room '+code+' via Supabase');
+    log.push('host created room '+code+' on a project with only the older schema');
 
     await waitFor('the room to be published to the backend',()=>DB.rooms.has(code),8000);
     log.push('room row exists in the backend, state.phase='+DB.rooms.get(code).phase);
@@ -258,8 +277,29 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
     const KNOWN=['put_room','get_room','drop_room','put_input','list_inputs','clear_inputs','drop_input'];
     const unknown=[...seenOps].filter(o=>KNOWN.indexOf(o)<0);
     if(unknown.length) throw new Error('client sent operations the SQL does not handle: '+unknown.join(', '));
-    log.push('backend calls: '+calls+', all authenticated, all via fs_rpc');
+    if(!seenFns.has('fs_rpc'))
+      throw new Error('the client never tried the current schema first');
+    if(!seenFns.has('fs_put_room'))
+      throw new Error('the fallback to the older schema never actually engaged');
+    log.push('backend calls: '+calls+', all authenticated');
+    log.push('routines called: '+[...seenFns].sort().join(', '));
     log.push('operations exercised: '+[...seenOps].sort().join(', '));
+    log.push('legacy-schema project played a full match without being asked to re-run any SQL');
+
+    // ...and a project on the current schema must not be dragged down the fallback path.
+    // Shut the legacy windows first: their sync loops keep polling and would otherwise
+    // show up as fallback traffic from the new one.
+    HOST.w.close(); RETURN.w.close();
+    await sleep(600);
+    LEGACY_ONLY=false; seenFns.clear();
+    const FRESH=makeWindow('fresh','#mp='+MP,makeStore());
+    await sleep(400);
+    profile(FRESH,'NIA');
+    FRESH.click('#b-create'); FRESH.click('#b-create-go');
+    await waitFor('the modern-schema host to publish a room',()=>seenFns.has('fs_rpc'),8000);
+    if([...seenFns].some(f=>f!=='fs_rpc'))
+      throw new Error('a current-schema project fell back needlessly: '+[...seenFns].join(', '));
+    log.push('current-schema project used fs_rpc only, no fallback');
 
     // bandwidth is the thing that decides whether a free project survives a match
     const wire=DB.rooms.get(code);

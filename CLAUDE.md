@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  210 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  218 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -111,6 +111,12 @@ adapters behind one four-call interface (`netPutState` / `netGetState` / `netPut
 Never send `Prefer: return=minimal` on an RPC call — PostgREST answers 204 with no body and
 every read silently comes back empty. `supaRequest` omits the header unless asked.
 
+An earlier schema gave every operation its own function. `rpcLegacyFor` still speaks it: the
+first call tries `fs_rpc`, and on PGRST202 falls back once and remembers the answer in
+`NET.dialect`. Deleting that shim is fine once no live project is still on the old schema.
+PGRST202 also means "the routine exists but PostgREST has not reloaded" — which is why `MP_SQL`
+ends with `notify pgrst, 'reload schema'` and the error text mentions waiting a few seconds.
+
 Things that are load-bearing and easy to break:
 
 - Actions are held in the client's outbox until `st.ack[playerId]` catches up. Never drop an
@@ -144,7 +150,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           210 core tests + 7 smoke runs
+npm test           218 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

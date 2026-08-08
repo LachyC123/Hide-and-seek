@@ -42,3 +42,6 @@ begin
 end $$;
 
 grant execute on function fs_rpc(text, text, text, jsonb) to anon;
+
+-- PostgREST caches the schema; without this the new routine can 404 for a while.
+notify pgrst, 'reload schema';

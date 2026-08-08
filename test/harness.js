@@ -719,6 +719,32 @@ t('the SQL clears out the earlier multi-routine version',()=>
 t('the SQL stays short enough to paste on a phone',()=>{
   const lines=C.MP_SQL.split('\n').length;
   return ok(lines<=50,'grown to '+lines+' lines');});
+t('the SQL tells the API to reload, so the routine is not 404 for a while',()=>
+  ok(/notify pgrst, 'reload schema'/.test(C.MP_SQL)));
+t('a project on the older seven-function schema is still fully playable',()=>{
+  // whatever the dialect, every operation must resolve to something callable
+  ALL_OPS.forEach(op=>{
+    const c=C.rpcLegacyFor(op,'ABCDE','p1',{x:1});
+    if(!c) throw new Error(op+' has no routine in the older schema');
+    if(c.args.p_code!=='ABCDE') throw new Error(op+' does not pass the room code');
+  });
+  return true;});
+t('the older schema still names the player for player-scoped calls',()=>{
+  const c=C.rpcLegacyFor('putInput','ABCDE','p1',{lat:1});
+  return ok(c.args.p_player==='p1'&&c.args.p_input.lat===1);});
+t('every operation exists in both dialects',()=>{
+  const missing=ALL_OPS.filter(op=>!C.rpcFor(op,'A')||!C.rpcLegacyFor(op,'A'));
+  return eq(missing.length,0,'missing in one dialect: '+missing.join(', '));});
+t('the two dialects use different routine names, or detection is pointless',()=>{
+  const a=C.rpcDialect('rpc','getState','A').fn, b=C.rpcDialect('legacy','getState','A').fn;
+  return ok(a!==b&&a==='fs_rpc');});
+t('an unknown dialect falls back to the current schema, not to nothing',()=>
+  eq(C.rpcDialect(undefined,'getState','A').fn,'fs_rpc'));
+t('a missing routine is recognised however PostgREST phrases it',()=>
+  ok(C.isMissingFn(404,'')&&C.isMissingFn(400,'{"code":"PGRST202"}')&&
+     !C.isMissingFn(401,'')&&!C.isMissingFn(500,'boom')));
+t('a stale schema cache is offered as an explanation, not just a missing install',()=>
+  ok(/try again in a few seconds/.test(C.supaErrorText(404,''))));
 t('a missing function is explained as unrun SQL, not as a 404',()=>
   ok(/SQL/.test(C.supaErrorText(404,''))&&/SQL/.test(C.supaErrorText(400,'{"code":"PGRST202"}'))));
 t('a rejected key points at the service_role mix-up',()=>

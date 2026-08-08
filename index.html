@@ -882,6 +882,28 @@ function rpcFor(op,code,id,payload){
   if(payload!==undefined&&payload!==null) args.body=payload;
   return {fn:'fs_rpc',args:args};
 }
+/* An earlier version of the schema gave every operation its own function. Projects
+   that ran it work exactly as well, so detect them and speak their dialect rather
+   than sending someone back to the SQL editor. Both return the same shapes.
+   Safe to delete once no project is still on the seven-function schema. */
+function rpcLegacyFor(op,code,id,payload){
+  if(op==='putState')    return {fn:'fs_put_room',    args:{p_code:code,p_state:payload}};
+  if(op==='getState')    return {fn:'fs_get_room',    args:{p_code:code}};
+  if(op==='dropRoom')    return {fn:'fs_drop_room',   args:{p_code:code}};
+  if(op==='putInput')    return {fn:'fs_put_input',   args:{p_code:code,p_player:id,p_input:payload}};
+  if(op==='listInputs')  return {fn:'fs_list_inputs', args:{p_code:code}};
+  if(op==='clearInputs') return {fn:'fs_clear_inputs',args:{p_code:code}};
+  if(op==='dropInput')   return {fn:'fs_drop_input',  args:{p_code:code,p_player:id}};
+  return null;
+}
+function rpcDialect(dialect,op,code,id,payload){
+  return dialect==='legacy'?rpcLegacyFor(op,code,id,payload):rpcFor(op,code,id,payload);
+}
+/* PostgREST says PGRST202 both when the routine was never created and when it exists
+   but the schema cache has not caught up yet — so this is not automatically "run the SQL". */
+function isMissingFn(status,body){
+  return status===404||/PGRST202/.test(body||'');
+}
 var MP_SQL=[
   '-- FALSE SAFE room storage. Paste all of this into the Supabase SQL editor and Run.',
   '-- Safe to run more than once.',
@@ -926,14 +948,17 @@ var MP_SQL=[
   '  return null;',
   'end $$;',
   '',
-  'grant execute on function fs_rpc(text, text, text, jsonb) to anon;'
+  'grant execute on function fs_rpc(text, text, text, jsonb) to anon;',
+  '',
+  '-- PostgREST caches the schema; without this the new routine can 404 for a while.',
+  "notify pgrst, 'reload schema';"
 ].join('\n').replace(/\$q\$/g,"'");
 
 /* PostgREST reports a missing function as PGRST202. That is not a network problem,
    it means the SQL was never run — say so instead of "HTTP 404". */
 function supaErrorText(status,body){
-  if(status===404||/PGRST202/.test(body||''))
-    return 'This project has not had the FALSE SAFE SQL run on it yet (or it is on the older table-based version). Open Multiplayer setup and run the SQL block once.';
+  if(isMissingFn(status,body))
+    return 'This project has not had the FALSE SAFE SQL run on it, or it ran but the API has not picked it up yet. Open Multiplayer setup, run the SQL block once, then try again in a few seconds.';
   if(status===401||status===403)
     return 'The project rejected the key. Check you pasted the anon public key, not the service_role one.';
   return 'HTTP '+status+(body?' — '+body.slice(0,140):'');
@@ -1205,7 +1230,8 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   reachableSpot:reachableSpot,
   newActions:newActions,mergePlayerInput:mergePlayerInput,pendingActions:pendingActions,
   presence:presence,presentVoters:presentVoters,lostHiders:lostHiders,hostAlive:hostAlive,
-  supaRequest:supaRequest,rpcFor:rpcFor,supaErrorText:supaErrorText,MP_SQL:MP_SQL,
+  supaRequest:supaRequest,rpcFor:rpcFor,rpcLegacyFor:rpcLegacyFor,rpcDialect:rpcDialect,
+  isMissingFn:isMissingFn,supaErrorText:supaErrorText,MP_SQL:MP_SQL,
   validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
   parseHash:parseHash,buildJoinLink:buildJoinLink,normaliseMpUrl:normaliseMpUrl,MP_DEFAULT:MP_DEFAULT,
   walkMins:walkMins,runDistance:runDistance,carLengths:carLengths,paceText:paceText,
@@ -1348,7 +1374,7 @@ function sget(k){ if(!hasStore()) return Promise.reject('nostore');
 function slist(prefix){ if(!hasStore()) return Promise.resolve([]);
   return window.storage.list(prefix,true).then(function(r){return (r&&r.keys)||[];}).catch(function(){return [];}); }
 
-var NET={kind:'none',mp:null,lastErr:null,ok:0,fails:0,lastOkAt:0};
+var NET={kind:'none',mp:null,lastErr:null,ok:0,fails:0,lastOkAt:0,dialect:null};
 function mpFallback(saved){
   if(validMp(saved)) return saved;
   if(validMp(MP_DEFAULT)) return {url:normaliseMpUrl(MP_DEFAULT.url),key:MP_DEFAULT.key};
@@ -1362,7 +1388,12 @@ function netKind(){
   if(hasStore()) return 'storage';
   return 'none';
 }
-function netRefresh(){ NET.kind=netKind(); NET.mp=NET.kind==='supabase'?G.mp:null; return NET.kind; }
+function netRefresh(){
+  var was=NET.mp&&NET.mp.key;
+  NET.kind=netKind(); NET.mp=NET.kind==='supabase'?G.mp:null;
+  if(!NET.mp||NET.mp.key!==was) NET.dialect=null;   // a different project may use a different schema
+  return NET.kind;
+}
 function netAvailable(){ return netRefresh()!=='none'; }
 function netLabel(){
   return NET.kind==='supabase'?'Supabase':NET.kind==='storage'?'Host bridge':'None';
@@ -1386,15 +1417,28 @@ function supaCall(path,opts){
   }catch(e){ return Promise.reject(e); }
   return p.then(function(res){
       if(!res.ok) return res.text().then(function(t){
-        throw new Error(supaErrorText(res.status,t));
+        var e=new Error(supaErrorText(res.status,t));
+        e.status=res.status; e.missingFn=isMissingFn(res.status,t);
+        throw e;
       });
       if(res.status===204) return null;                    // a void function
       return res.text().then(function(t){ return t?JSON.parse(t):null; });
     });
 }
 function supaRpc(op,code,id,payload){
-  var c=rpcFor(op,code,id,payload);
-  return supaCall('rpc/'+c.fn,{method:'POST',body:c.args});
+  var call=function(dialect){
+    var c=rpcDialect(dialect,op,code,id,payload);
+    if(!c) return Promise.reject(new Error('unknown room operation: '+op));
+    return supaCall('rpc/'+c.fn,{method:'POST',body:c.args});
+  };
+  if(NET.dialect) return call(NET.dialect);
+  return call('rpc').then(function(v){ NET.dialect='rpc'; return v; },function(e){
+    if(!e||!e.missingFn) throw e;
+    // no fs_rpc — the project may be on the older per-function schema
+    return call('legacy').then(function(v){ NET.dialect='legacy'; return v; },function(e2){
+      throw (e2&&e2.missingFn)?e:e2;      // neither exists: report the clearer message
+    });
+  });
 }
 
 /* The whole room state goes over the wire several times a minute for every player,
@@ -2793,7 +2837,7 @@ function renderDevLog(){
     'zone r='+Math.round(lerpZone(st).r)+'m stage '+st.zoneStage+(st.next?' (next revealed)':''),
     'imposter '+(st.imposterId?(st.players[st.imposterId]||{}).name:'none')+(st.imposterEligible?'':' [EXPOSED]')+
       '  tips '+st.tips,
-    'net '+netLabel().toLowerCase()+' '+ns.t.toLowerCase()+'  ok '+NET.ok+'  fail '+NET.fails+
+    'net '+netLabel().toLowerCase()+' '+ns.t.toLowerCase()+(NET.dialect?'/'+NET.dialect:'')+'  ok '+NET.ok+'  fail '+NET.fails+
       '  ver '+st.ver+'  pending '+pendingActions(G.outbox,G.ack).length,
     'gps '+G.gps+(G.pos?' acc '+Math.round(G.pos.acc||0)+'m':'')
   ];
@@ -2846,7 +2890,7 @@ function diagRows(){
   var ns=netStatus();
   rows.push({s:NET.kind==='none'?'warn':ns.s,t:'Multiplayer',
     d:NET.kind==='none'?'No transport set up. Create game will only offer solo play — open Multiplayer setup to connect a Supabase project.'
-      :(netLabel()+' · '+ns.t+(G.code?' · room '+G.code:' · no room open')+
+      :(netLabel()+' · '+ns.t+(NET.dialect?' · '+NET.dialect+' schema':'')+(G.code?' · room '+G.code:' · no room open')+
         (NET.lastErr?'. Last error: '+NET.lastErr:'.'))});
   rows.push({s:TILE.loaded?'ok':TILE.fails?'warn':'warn',t:'Map tiles (backup)',
     d:TILE.loaded?(TILE.loaded+' tiles loaded.'):TILE.fails?('Blocked or unreachable after '+TILE.fails+' attempts. Streets or the pixel world will be used.'):'Not needed yet.'});
