@@ -2,6 +2,8 @@ const fs=require('fs');const {JSDOM}=require('jsdom');const stubAll=require('./_
 const html=fs.readFileSync(require('path').join(__dirname,'..','index.html'),'utf8');
 const errors=[];const dom=new JSDOM(html,{runScripts:'dangerously',pretendToBeVisual:true,url:'https://example.com/',beforeParse:stubAll});
 const w=dom.window;w.addEventListener('error',e=>errors.push(e.message));
+// a modern phone, so the preview has to be drawn at three device pixels per CSS pixel
+Object.defineProperty(w,'devicePixelRatio',{value:3,configurable:true});
 const calls=[];
 const stub=new Proxy({},{get:(t,k)=>k==='measureText'?(()=>({width:20})):((...a)=>{calls.push(k);})});
 w.HTMLCanvasElement.prototype.getContext=()=>stub;w.requestAnimationFrame=()=>0;
@@ -26,6 +28,12 @@ setTimeout(()=>{
     drag('Time to turn seeker',90); out.push(cap());
     out.push('focused row highlighted: '+(row('Time to turn seeker').className.indexOf('focus')>=0));
     out.push('canvas ops fired: '+calls.length);
+    // The preview used to be capped at 2x and drawn through a half-size buffer, which is
+    // what made it look soft on a phone. Backing store must match the screen's density.
+    const pv=q('#setupMap');
+    out.push('preview backing store: '+pv.width+'x'+pv.height+' for a 3x screen');
+    if(pv.width!==960||pv.height!==570)
+      errors.push('preview is not drawn at full device resolution ('+pv.width+'x'+pv.height+')');
     console.log('\nFALSE SAFE — rules preview');console.log('─'.repeat(38));
     out.forEach(o=>console.log('  · '+o));
     console.log(errors.length?('  ERRORS '+errors.join(';')):'  no runtime errors');

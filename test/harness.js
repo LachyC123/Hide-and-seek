@@ -884,6 +884,16 @@ t('connection details survive characters that need escaping',()=>{
   const mp={url:'https://a-b.supabase.co',key:'ab+/=cd'.repeat(6)};
   return eq(C.decodeMpConfig(C.encodeMpConfig(mp)).key,mp.key);});
 
+t('a denser screen is given a more detailed map, not a stretched one',()=>{
+  const mpp=4;
+  const at1=C.zoomForMpp(O.lat,mpp), at2=C.zoomForMpp(O.lat,mpp/2), at3=C.zoomForMpp(O.lat,mpp/3);
+  return ok(at2>at1&&at3>=at2,'zooms were '+at1+', '+at2+', '+at3);});
+t('map detail is still bounded, however dense the screen claims to be',()=>{
+  const z=C.zoomForMpp(O.lat,0.0001);
+  return ok(z<=19,'ran away to zoom '+z);});
+t('a huge play area does not ask for a zoom that does not exist',()=>
+  ok(C.zoomForMpp(O.lat,5000)>=14));
+
 console.log('\nFALSE SAFE — core harness');
 console.log('─'.repeat(38));
 failures.forEach(f=>console.log('  FAIL  '+f));

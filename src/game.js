@@ -1671,7 +1671,9 @@ function initMap(){
 }
 function resizeMap(){
   if(!cv) return;
-  DPR=Math.min(2,window.devicePixelRatio||1);
+  // Phones have been 3x for years. Capping at 2 threw away a third of the resolution
+  // before a single pixel was drawn.
+  DPR=Math.min(3,window.devicePixelRatio||1);
   VW=cv.clientWidth||window.innerWidth; VH=cv.clientHeight||window.innerHeight;
   cv.width=Math.floor(VW*DPR); cv.height=Math.floor(VH*DPR);
   ctx.setTransform(DPR,0,0,DPR,0,0); ctx.imageSmoothingEnabled=false;
@@ -2668,7 +2670,7 @@ function paintScene(id){
 /* ============================================================
    PART 6 — real map tiles, match settings, GPS readout
    ============================================================ */
-var TILE={on:true,cache:{},loaded:0,fails:0,off:null,octx:null};
+var TILE={on:true,cache:{},loaded:0,fails:0};
 function tileImg(x,y,z){
   var key=z+'/'+x+'/'+y, t=TILE.cache[key];
   if(!t){
@@ -2686,28 +2688,33 @@ function tileImg(x,y,z){
 }
 function drawTiles(){
   if(!TILE.on||CFG.mapStyle!=='real') return false;
-  var z=zoomForMpp(G.view.lat,G.view.mpp);
+  // Pick the tile zoom for the density of the screen, not for CSS pixels — otherwise a
+  // 3x phone is handed a 1x image and asked to stretch it. Held at 2x: past that the
+  // tile count per view climbs faster than the sharpness does.
+  var sharp=Math.min(DPR||1,2);
+  var z=zoomForMpp(G.view.lat,G.view.mpp/sharp);
   var tm=tileMpp(G.view.lat,z)*256, px=tm/G.view.mpp;
-  if(!isFinite(px)||px<32) return false;
-  var W=Math.max(1,Math.floor(VW/2)),H=Math.max(1,Math.floor(VH/2));
-  if(!TILE.off){ TILE.off=document.createElement('canvas'); TILE.octx=TILE.off.getContext('2d'); }
-  if(TILE.off.width!==W||TILE.off.height!==H){ TILE.off.width=W; TILE.off.height=H; }
-  var o=TILE.octx; o.imageSmoothingEnabled=false;
-  o.fillStyle='#1a1f2b'; o.fillRect(0,0,W,H);
+  if(!isFinite(px)||px<24) return false;
   var cx=lon2tile(G.view.lng,z), cy=lat2tile(G.view.lat,z), n=Math.pow(2,z);
-  var hx=Math.ceil(W/(px/2)/2)+1, hy=Math.ceil(H/(px/2)/2)+1, drew=0;
+  var hx=Math.ceil(VW/px/2)+1, hy=Math.ceil(VH/px/2)+1, drew=0;
+  // snap to whole device pixels so tile seams do not land mid-pixel and smear
+  var snap=function(v){ var d=DPR||1; return Math.round(v*d)/d; };
+  ctx.save();
+  ctx.imageSmoothingEnabled=true;                     // map tiles are photographs, not sprites
+  if(ctx.imageSmoothingQuality!==undefined) ctx.imageSmoothingQuality='high';
+  ctx.fillStyle='#1a1f2b'; ctx.fillRect(0,0,VW,VH);
   for(var i=-hx;i<=hx;i++) for(var j=-hy;j<=hy;j++){
     var tx=Math.floor(cx)+i, ty=Math.floor(cy)+j;
     if(ty<0||ty>=n) continue;
     var t=tileImg(((tx%n)+n)%n,ty,z);
     if(!t.ok) continue;
-    var sx=W/2+(tx-cx)*px/2, sy=H/2+(ty-cy)*px/2;
-    o.drawImage(t.img,Math.floor(sx),Math.floor(sy),Math.ceil(px/2)+1,Math.ceil(px/2)+1);
+    var sx=snap(VW/2+(tx-cx)*px), sy=snap(VH/2+(ty-cy)*px);
+    ctx.drawImage(t.img,sx,sy,px+1/(DPR||1),px+1/(DPR||1));
     drew++;
   }
+  ctx.restore();
   if(!drew) return false;
   ctx.imageSmoothingEnabled=false;
-  ctx.drawImage(TILE.off,0,0,VW,VH);
   // knock the real map back so the game layer reads on top of it
   ctx.fillStyle='rgba(14,12,26,0.52)'; ctx.fillRect(0,0,VW,VH);
   ctx.fillStyle='rgba(67,176,232,0.06)'; ctx.fillRect(0,0,VW,VH);
@@ -2919,10 +2926,10 @@ function mapSourceLabel(){
 
 /* ---------- live scale preview on the rules screen ---------- */
 var PV={focus:'areaR',dirty:true};
-function withCanvas(pctx,w,h,view,fn){
-  var oc=ctx,ow=VW,oh=VH,ov=G.view;
-  ctx=pctx; VW=w; VH=h; G.view=view;
-  try{ fn(); } finally { ctx=oc; VW=ow; VH=oh; G.view=ov; }
+function withCanvas(pctx,w,h,view,fn,dpr){
+  var oc=ctx,ow=VW,oh=VH,ov=G.view,od=DPR;
+  ctx=pctx; VW=w; VH=h; G.view=view; if(dpr) DPR=dpr;
+  try{ fn(); } finally { ctx=oc; VW=ow; VH=oh; G.view=ov; DPR=od; }
 }
 var PV_MODE={matchLen:'area',areaR:'area',scatter:'run',catchRadius:'catch',gpsForgive:'catch',
   conversion:'run',trackScale:'signal',zoneStages:'zones',zoneShrink:'zones',
@@ -2943,9 +2950,10 @@ function pvScaleBar(mpp){
 }
 function drawPreview(){
   var c=document.getElementById('setupMap'); if(!c) return;
-  var W=c.clientWidth||320,H=190;
-  var dpr=Math.min(2,window.devicePixelRatio||1);
-  if(c.width!==Math.floor(W*dpr)){ c.width=Math.floor(W*dpr); c.height=Math.floor(H*dpr); }
+  var W=c.clientWidth||320,H=c.clientHeight||190;
+  var dpr=Math.min(3,window.devicePixelRatio||1);
+  var wantW=Math.round(W*dpr), wantH=Math.round(H*dpr);
+  if(c.width!==wantW||c.height!==wantH){ c.width=wantW; c.height=wantH; }
   var p=c.getContext('2d');
   p.setTransform(dpr,0,0,dpr,0,0); p.imageSmoothingEnabled=false;
   var cfg=sanitiseCfg(G.cfg); applyCfg(cfg);
@@ -2958,7 +2966,10 @@ function drawPreview(){
   var cap='',sub='';
   withCanvas(p,W,H,view,function(){
     var z={lat:centre.lat,lng:centre.lng,r:cfg.areaR};
-    if(!drawTiles()) drawTerrain(z);
+    // same order as the real map: vector streets first. They are drawn as lines rather
+    // than resampled from a photograph, so they stay crisp and they match what you will
+    // actually be looking at during the match.
+    drawTerrain(z);
     var mid={x:W/2,y:H/2};
     if(mode==='area'){
       var r=cfg.areaR/mpp;
@@ -3020,7 +3031,7 @@ function drawPreview(){
       sub='A mid-game blip only narrows you down to this circle — '+paceText(unc)+' from the middle to the edge. The seeker still has to search it.';
     }
     pvScaleBar(mpp);
-  });
+  },dpr);
   var capEl=document.getElementById('setupCaption');
   if(capEl){ capEl.firstElementChild.textContent=cap; capEl.lastElementChild.textContent=sub; }
 }

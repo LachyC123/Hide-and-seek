@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  239 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  242 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -69,6 +69,12 @@ Break any of these and the game stops making sense:
 - Hiders see no other players. Seekers see other seekers, plus hiders only during FULL SIGNAL
   or a sustained zone violation. The imposter gets no omniscience.
 - Blips are approximate and tighten over the match; they never pin a hider exactly.
+- Canvases are sized to `window.devicePixelRatio` (up to 3x) and tile zoom is chosen for that
+  density, not for CSS pixels. Drawing the map through a reduced-size buffer, or capping the
+  backing store below the screen, is what made it look soft — a smoke test pins the preview's
+  backing store to the device ratio.
+- Smoothing stays off for the game layer, which is pixel art, and on for map tiles, which are
+  photographs. Turning it off globally makes every upscaled tile blocky.
 - Catch validation requires fresh location on both sides, correct roles, and the GPS allowance.
 - Anything a player is told to physically walk to — objectives, the imposter's lure spot, bot
   spawns — goes through `reachableSpot`, so it lands on a real street when road data exists.
@@ -158,7 +164,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           239 core tests + 7 smoke runs
+npm test           242 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 
