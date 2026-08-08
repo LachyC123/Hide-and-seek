@@ -23,7 +23,8 @@ var CFG={
   fullSignal:{1:60,2:90}, zoneStages:5, zoneShrink:0.66, zoneMinR:45,
   zonePreview:150, zoneClose:45, graceOutside:45, tribunals:2,
   missionFollowRadius:25, missionFollowTime:30, objectiveRadius:20, objectiveTime:15,
-  trackScale:1, trackRate:1, hiderSight:1, objectives:1, mapStyle:'real',
+  trackScale:1, trackRate:1, hiderSight:1, nearWarn:70, objectives:1, mapStyle:'real',
+  dimAfter:60,   // seconds untouched before the screen drops to low power
   // GPS handling
   gpsForgive:1, catchSlop:0.5, catchSlopMax:15, maxAcc:65, maxSpeed:12, gpsQ:1.6,
   // multiplayer presence: a phone that stops reporting is stale, then lost
@@ -35,7 +36,7 @@ var DEFAULTS=JSON.parse(JSON.stringify(CFG));
 function applyCfg(c){
   if(!c) return CFG;
   ['scatter','catchRadius','conversion','zoneStages','tribunals','trackScale','trackRate',
-   'hiderSight','objectives','gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
+   'hiderSight','nearWarn','objectives','gpsForgive','mapStyle'].forEach(function(k){ if(c[k]!==undefined) CFG[k]=c[k]; });
   if(c.zoneShrink!==undefined) CFG.zoneShrink=clampN(c.zoneShrink,0.4,0.95);
   if(c.fullSignal!==undefined){ CFG.fullSignal={1:c.fullSignal,2:c.fullSignal+30}; }
   return CFG;
@@ -44,7 +45,7 @@ function clampN(v,a,b){return v<a?a:v>b?b:v;}
 function sanitiseCfg(c){
   var d={matchLen:1800,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
     fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-    hiderSight:1,objectives:1,gpsForgive:1,mapStyle:'real'};
+    hiderSight:1,nearWarn:70,objectives:1,gpsForgive:1,mapStyle:'real'};
   c=c||{};
   var o={
     matchLen:clampN(+c.matchLen||d.matchLen,600,5400),
@@ -61,6 +62,7 @@ function sanitiseCfg(c){
     // 0 is a real choice here, not a missing value: it means seekers get no routine signals
     trackRate:clampN(c.trackRate===undefined?d.trackRate:+c.trackRate,0,2),
     hiderSight:(c.hiderSight===undefined?d.hiderSight:(c.hiderSight?1:0)),
+    nearWarn:clampN(c.nearWarn===undefined?d.nearWarn:+c.nearWarn,0,150),
     objectives:(c.objectives===undefined?d.objectives:(c.objectives?1:0)),
     gpsForgive:(c.gpsForgive===undefined?d.gpsForgive:(c.gpsForgive?1:0)),
     mapStyle:(c.mapStyle==='pixel'?'pixel':'real')
@@ -148,6 +150,19 @@ function sees(mine,p,st,nowMs){
   // missions that turn it into something the seekers can use. An exposed imposter has lost
   // their powers and from then on sees exactly what an ordinary hider sees.
   return !!(st&&st.imposterEligible&&mine.id===st.imposterId);
+}
+/* How close the nearest seeker is. The mood colour already leaked this at a fixed
+   70 m; making it explicit and host-tunable is honest rather than accidental. */
+function nearestSeeker(players,me){
+  var best=Infinity;
+  if(!players||!me||me.lat==null) return best;
+  Object.keys(players).forEach(function(id){
+    var q=players[id];
+    if(!q||q.role!=='seeker'||q.caught||q.lat==null||id===me.id) return;
+    var d=metersBetween(me,q);
+    if(d<best) best=d;
+  });
+  return best;
 }
 function makeBlip(rng,pos,progress,jammed){
   var b=trackingBand(progress);
@@ -571,10 +586,217 @@ function parseHash(hash){
   var code=(out.room||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
   return {code:code||null,mp:decodeMpConfig(out.mp)};
 }
+/* The connection is ~260 characters and dwarfs everything else in the link. When the
+   page already carries it in the build, leaving it out turns a link nobody can scan
+   into a short one — and the guest opens the same deployment either way, so they get
+   the same connection regardless. */
 function buildJoinLink(base,code,mp){
   var h='#room='+encodeURIComponent(code||''), m=encodeMpConfig(mp);
   if(m) h+='&mp='+m;
   return String(base||'').split('#')[0]+h;
+}
+function sameMp(a,b){
+  return !!(a&&b&&normaliseMpUrl(a.url)===normaliseMpUrl(b.url)&&a.key===b.key);
+}
+
+/* ---------- QR codes ----------
+   Written out because this project has no dependencies and never will. Byte mode,
+   error correction level M, versions 1-10 — far more than a room link needs, and M
+   survives a scan off a slightly grubby phone screen better than L does.
+   Returns a square array of 0/1 rows, or null if the text simply will not fit. */
+var QR_M=[null,
+  [16,10,1,16,0,0],[28,16,1,28,0,0],[44,26,1,44,0,0],[64,18,2,32,0,0],[86,24,2,43,0,0],
+  [108,16,4,27,0,0],[124,18,4,31,0,0],[154,22,2,38,2,39],[182,22,3,36,2,37],[216,26,4,43,1,44]];
+var QR_ALIGN=[null,[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50]];
+
+var GF_EXP=[],GF_LOG=[];
+(function(){
+  var x=1,i;
+  for(i=0;i<255;i++){ GF_EXP[i]=x; GF_LOG[x]=i; x<<=1; if(x&0x100) x^=0x11d; }
+  for(i=255;i<512;i++) GF_EXP[i]=GF_EXP[i-255];
+})();
+function gfMul(a,b){ return (a===0||b===0)?0:GF_EXP[GF_LOG[a]+GF_LOG[b]]; }
+function rsGenerator(n){
+  var p=[1];
+  for(var i=0;i<n;i++){
+    var q=p.concat([0]);
+    for(var j=0;j<p.length;j++) q[j+1]^=gfMul(p[j],GF_EXP[i]);
+    p=q;
+  }
+  return p;
+}
+function rsEncode(data,n){
+  var gen=rsGenerator(n),res=[],i,j;
+  for(i=0;i<n;i++) res.push(0);
+  for(i=0;i<data.length;i++){
+    var f=data[i]^res[0];
+    res.shift(); res.push(0);
+    if(f) for(j=0;j<n;j++) res[j]^=gfMul(gen[j+1],f);
+  }
+  return res;
+}
+function utf8Bytes(str){
+  var out=[],e=encodeURIComponent(String(str));
+  for(var i=0;i<e.length;i++){
+    if(e.charAt(i)==='%'){ out.push(parseInt(e.substr(i+1,2),16)); i+=2; }
+    else out.push(e.charCodeAt(i));
+  }
+  return out;
+}
+function qrMask(k,r,c){
+  if(k===0) return (r+c)%2===0;
+  if(k===1) return r%2===0;
+  if(k===2) return c%3===0;
+  if(k===3) return (r+c)%3===0;
+  if(k===4) return (Math.floor(r/2)+Math.floor(c/3))%2===0;
+  if(k===5) return ((r*c)%2)+((r*c)%3)===0;
+  if(k===6) return (((r*c)%2)+((r*c)%3))%2===0;
+  return ((((r+c)%2)+((r*c)%3))%2)===0;
+}
+function qrFormatBits(ecBits,mask){
+  var d=(ecBits<<3)|mask,rem=d;
+  for(var i=0;i<10;i++) rem=(rem<<1)^((rem>>>9)*0x537);
+  return (((d<<10)|rem)^0x5412)&0x7fff;
+}
+function qrVersionBits(ver){
+  var rem=ver;
+  for(var i=0;i<12;i++) rem=(rem<<1)^((rem>>>11)*0x1f25);
+  return ((ver<<12)|rem)&0x3ffff;
+}
+/* penalty rules from the spec — picking the lowest-scoring mask is what stops a code
+   coming out with big blank runs a scanner mistakes for a finder pattern */
+function qrPenalty(m){
+  var n=m.length,score=0,r,c,i,run,last,dark=0;
+  for(r=0;r<n;r++){
+    run=1; last=-1;
+    for(c=0;c<n;c++){
+      if(m[r][c]===last) run++; else { if(run>=5) score+=3+(run-5); run=1; last=m[r][c]; }
+      if(m[r][c]) dark++;
+    }
+    if(run>=5) score+=3+(run-5);
+  }
+  for(c=0;c<n;c++){
+    run=1; last=-1;
+    for(r=0;r<n;r++){
+      if(m[r][c]===last) run++; else { if(run>=5) score+=3+(run-5); run=1; last=m[r][c]; }
+    }
+    if(run>=5) score+=3+(run-5);
+  }
+  for(r=0;r<n-1;r++) for(c=0;c<n-1;c++){
+    var v=m[r][c];
+    if(v===m[r][c+1]&&v===m[r+1][c]&&v===m[r+1][c+1]) score+=3;
+  }
+  var pat=[1,0,1,1,1,0,1,0,0,0,0], pat2=[0,0,0,0,1,0,1,1,1,0,1];
+  var hit=function(get){
+    var s=0;
+    for(var a=0;a+10<n;a++){
+      var ok1=true,ok2=true;
+      for(i=0;i<11;i++){ var g=get(a+i); if(g!==pat[i]) ok1=false; if(g!==pat2[i]) ok2=false; }
+      if(ok1) s+=40; if(ok2) s+=40;
+    }
+    return s;
+  };
+  for(r=0;r<n;r++) score+=hit(function(k){return m[r][k];});
+  for(c=0;c<n;c++) score+=hit(function(k){return m[k][c];});
+  var pct=dark*100/(n*n);
+  score+=Math.floor(Math.abs(pct-50)/5)*10;
+  return score;
+}
+function qrEncode(text,maxVer){
+  var bytes=utf8Bytes(text),ver=0,v,i,j;
+  maxVer=Math.min(maxVer||10,10);
+  for(v=1;v<=maxVer;v++){
+    var cc=(v<10)?8:16;
+    if(4+cc+bytes.length*8<=QR_M[v][0]*8){ ver=v; break; }
+  }
+  if(!ver) return null;
+  var spec=QR_M[ver],cap=spec[0]*8,ecLen=spec[1],bits=[];
+  var put=function(val,len){ for(var k=len-1;k>=0;k--) bits.push((val>>>k)&1); };
+  put(4,4); put(bytes.length,(ver<10)?8:16);
+  for(i=0;i<bytes.length;i++) put(bytes[i],8);
+  for(i=0;i<4&&bits.length<cap;i++) bits.push(0);
+  while(bits.length%8) bits.push(0);
+  for(i=0;bits.length<cap;i++) put(i%2===0?0xEC:0x11,8);
+  var data=[];
+  for(i=0;i<bits.length;i+=8){ var b=0; for(j=0;j<8;j++) b=(b<<1)|bits[i+j]; data.push(b); }
+  var blocks=[],idx=0,take=function(count,len){
+    for(var k=0;k<count;k++){ blocks.push(data.slice(idx,idx+len)); idx+=len; } };
+  take(spec[2],spec[3]); take(spec[4],spec[5]);
+  var ecs=[];
+  for(i=0;i<blocks.length;i++) ecs.push(rsEncode(blocks[i],ecLen));
+  var out=[],maxLen=0;
+  for(i=0;i<blocks.length;i++) if(blocks[i].length>maxLen) maxLen=blocks[i].length;
+  for(i=0;i<maxLen;i++) for(j=0;j<blocks.length;j++) if(i<blocks[j].length) out.push(blocks[j][i]);
+  for(i=0;i<ecLen;i++) for(j=0;j<ecs.length;j++) out.push(ecs[j][i]);
+
+  var size=17+4*ver,m=[],fn=[],r,c;
+  for(r=0;r<size;r++){ m.push([]); fn.push([]);
+    for(c=0;c<size;c++){ m[r].push(0); fn[r].push(0); } }
+  var setF=function(rr,cc,val){
+    if(rr<0||rr>=size||cc<0||cc>=size) return;
+    m[rr][cc]=val?1:0; fn[rr][cc]=1; };
+  var finder=function(fr,fc){
+    for(var dr=-1;dr<=7;dr++) for(var dc=-1;dc<=7;dc++){
+      var inner=(dr>=0&&dr<=6&&dc>=0&&dc<=6);
+      var on=inner&&(dr===0||dr===6||dc===0||dc===6||(dr>=2&&dr<=4&&dc>=2&&dc<=4));
+      setF(fr+dr,fc+dc,on);
+    } };
+  finder(0,0); finder(0,size-7); finder(size-7,0);
+  for(i=8;i<size-8;i++){ setF(6,i,i%2===0); setF(i,6,i%2===0); }
+  var al=QR_ALIGN[ver];
+  for(i=0;i<al.length;i++) for(j=0;j<al.length;j++){
+    var ar=al[i],ac=al[j];
+    if((ar===6&&ac===6)||(ar===6&&ac===size-7)||(ar===size-7&&ac===6)) continue;
+    for(var dr2=-2;dr2<=2;dr2++) for(var dc2=-2;dc2<=2;dc2++)
+      setF(ar+dr2,ac+dc2,Math.max(Math.abs(dr2),Math.abs(dc2))!==1);
+  }
+  setF(size-8,8,1);
+  var reserve=function(rr,cc){ if(!fn[rr][cc]){ m[rr][cc]=0; fn[rr][cc]=1; } };
+  for(i=0;i<=8;i++){ reserve(8,i); reserve(i,8); }
+  for(i=0;i<8;i++){ reserve(8,size-1-i); reserve(size-1-i,8); }
+  if(ver>=7){
+    var vb=qrVersionBits(ver);
+    for(i=0;i<18;i++){
+      var vbit=(vb>>>i)&1;
+      setF(Math.floor(i/3),size-11+(i%3),vbit);
+      setF(size-11+(i%3),Math.floor(i/3),vbit);
+    }
+  }
+  var place=function(mask){
+    var ii=0,up=true,col,k,s2;
+    for(col=size-1;col>=1;col-=2){
+      if(col===6) col=5;
+      for(k=0;k<size;k++){
+        var rr=up?(size-1-k):k;
+        for(s2=0;s2<2;s2++){
+          var cc=col-s2;
+          if(fn[rr][cc]) continue;
+          var bit=(ii<out.length*8)?((out[ii>>3]>>>(7-(ii&7)))&1):0;
+          ii++;
+          if(qrMask(mask,rr,cc)) bit^=1;
+          m[rr][cc]=bit;
+        }
+      }
+      up=!up;
+    }
+  };
+  var format=function(mask){
+    var f=qrFormatBits(0,mask),k;
+    for(k=0;k<=5;k++) m[k][8]=(f>>>k)&1;
+    m[7][8]=(f>>>6)&1; m[8][8]=(f>>>7)&1; m[8][7]=(f>>>8)&1;
+    for(k=9;k<15;k++) m[8][14-k]=(f>>>k)&1;
+    for(k=0;k<8;k++) m[size-1-k][8]=(f>>>k)&1;
+    for(k=8;k<15;k++) m[8][size-15+k]=(f>>>k)&1;
+    m[size-8][8]=1;
+  };
+  var best=null,bestScore=Infinity;
+  for(var mk=0;mk<8;mk++){
+    place(mk); format(mk);
+    var sc=qrPenalty(m);
+    if(sc<bestScore){ bestScore=sc; best=mk; }
+  }
+  place(best); format(best);
+  return {size:size,version:ver,mask:best,modules:m};
 }
 
 /* slippy-tile maths for the real map layer */
@@ -792,7 +1014,7 @@ function ROAD_STYLE(k){
 var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetLatLng,CFG:CFG,
   schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,nextZone:nextZone,
   zoneContains:zoneContains,zoneStageTimes:zoneStageTimes,trackingBand:trackingBand,makeBlip:makeBlip,
-  signalGap:signalGap,sees:sees,
+  signalGap:signalGap,sees:sees,nearestSeeker:nearestSeeker,
   canCatch:canCatch,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
   factionCounts:factionCounts,checkWin:checkWin,outsideState:outsideState,pickMission:pickMission,
   missionTick:missionTick,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
@@ -809,6 +1031,7 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   isMissingFn:isMissingFn,supaErrorText:supaErrorText,MP_SQL:MP_SQL,
   validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
   parseHash:parseHash,buildJoinLink:buildJoinLink,normaliseMpUrl:normaliseMpUrl,MP_DEFAULT:MP_DEFAULT,
+  sameMp:sameMp,qrEncode:qrEncode,rsGenerator:rsGenerator,qrFormatBits:qrFormatBits,utf8Bytes:utf8Bytes,
   walkMins:walkMins,runDistance:runDistance,carLengths:carLengths,paceText:paceText,
   zonePlan:zonePlan,previewMpp:previewMpp,scaleBarFor:scaleBarFor,
   lon2tile:lon2tile,lat2tile:lat2tile,tile2lon:tile2lon,tile2lat:tile2lat,tileMpp:tileMpp,zoomForMpp:zoomForMpp};
@@ -1596,6 +1819,50 @@ function netLoop(){
   setTimeout(netLoop,250);
 }
 
+/* ---------- low power ----------
+   Holding the screen awake for 45 minutes is what actually flattens a phone. When it has
+   been pocketed for a while, stop drawing the map and drop to a nearly black screen that
+   still shows the two things you would want at a glance. One tap brings it all back. */
+var POWER={dim:false,last:0,lastFrame:0,told:false};
+function touched(){ POWER.last=now(); if(POWER.dim) undim(); }
+function undim(){ POWER.dim=false; var d=$('#lowpower'); if(d) d.classList.add('hidden'); }
+function powerTick(){
+  var st=G.st;
+  if(CUR!=='s-match'||!st||st.phase==='RESULTS'||isPaused(st)){ if(POWER.dim) undim(); return; }
+  if(!POWER.last) POWER.last=now();
+  // never dim on someone who is one tap away from a catch
+  var busy=!aBusy?false:true;
+  var catchUp=$('#catchbtn')&&!$('#catchbtn').classList.contains('hidden');
+  if(catchUp||busy){ POWER.last=now(); if(POWER.dim) undim(); return; }
+  if(!POWER.dim&&now()-POWER.last>CFG.dimAfter*1000){
+    POWER.dim=true;
+    var d=$('#lowpower'); if(d) d.classList.remove('hidden');
+    if(!POWER.told){ POWER.told=true; }
+  }
+  if(POWER.dim){
+    var p=me(); if(!p) return;
+    var s=schedule(st.cfg);
+    $('#lpRole').textContent=p.caught?'CAUGHT':(p.role==='seeker'?'SEEKER':'HIDER');
+    $('#lpTime').textContent=st.phase==='SCATTER'?mmss(CFG.scatter-matchT())
+      :mmss(Math.max(0,s.end-huntClock(matchT())));
+  }
+}
+var BATT=null;
+function watchBattery(){
+  if(!navigator.getBattery) return;
+  try{ navigator.getBattery().then(function(b){ BATT=b; },function(){}); }catch(e){}
+}
+function batteryNote(minutes){
+  if(!BATT||typeof BATT.level!=='number') return null;
+  var pct=Math.round(BATT.level*100);
+  if(BATT.charging) return {s:'ok',t:pct+'% and charging.'};
+  // rough: a screen-on match with GPS costs roughly 0.5% a minute on a typical phone
+  var need=Math.round(minutes*0.5);
+  return {s:pct-need>15?'ok':'warn',
+    t:pct+'% now. A '+Math.round(minutes)+' minute match with the screen on uses roughly '+
+      need+'%'+(pct-need>15?'.':' — worth a top-up or a shorter match first.')};
+}
+
 /* ---------- keeping the phone awake ----------
    A locked phone stops reporting its position, which makes that player impossible to
    catch and invisible to everyone. The browser drops a wake lock every time the page
@@ -1619,7 +1886,7 @@ function releaseAwake(){
   if(WAKE.lock){ try{ WAKE.lock.release(); }catch(e){} WAKE.lock=null; }
 }
 function onResume(){
-  keepAwake();
+  keepAwake(); touched();
   // a backgrounded tab has had its timers throttled: pull the room now, not in 1.5s
   G.lastPush=0; G.flush=true; G.netBusy=false;
   if(navigator.geolocation&&G.gps!=='virtual'){
@@ -2023,6 +2290,26 @@ function saveMp(){
   });
 }
 
+function drawQR(cv,text){
+  if(!cv) return false;
+  var q=qrEncode(text);
+  if(!q) return false;
+  var quiet=2, cells=q.size+quiet*2;
+  var dpr=Math.min(3,window.devicePixelRatio||1);
+  var css=Math.min(cv.parentNode?cv.parentNode.clientWidth||220:220,220);
+  var scale=Math.max(1,Math.floor(css*dpr/cells));      // whole pixels per module, or it blurs
+  var px=cells*scale;
+  if(cv.width!==px){ cv.width=px; cv.height=px; }
+  cv.style.width=Math.round(px/dpr)+'px'; cv.style.height=Math.round(px/dpr)+'px';
+  var x=cv.getContext('2d');
+  x.imageSmoothingEnabled=false;
+  x.fillStyle='#f2ecdf'; x.fillRect(0,0,px,px);         // quiet zone must be light
+  x.fillStyle='#0b0916';
+  for(var r=0;r<q.size;r++) for(var c=0;c<q.size;c++)
+    if(q.modules[r][c]) x.fillRect((c+quiet)*scale,(r+quiet)*scale,scale,scale);
+  return true;
+}
+
 /* ---------- lobby ---------- */
 function presenceLabel(p,st){
   if(p.bot) return 'bot';
@@ -2049,7 +2336,11 @@ function renderLobby(){
   if(lp){
     var showLink=G.mode==='net'&&G.isHost&&G.joinLink;
     lp.classList.toggle('hidden',!showLink);
-    if(showLink&&ll) ll.textContent=G.joinLink;
+    if(showLink&&ll&&ll.textContent!==G.joinLink){
+      ll.textContent=G.joinLink;
+      var qc=$('#lobbyQR'), ok2=drawQR(qc,G.joinLink);
+      $('#lobbyQRWrap').classList.toggle('hidden',!ok2);
+    }
   }
   $('#b-start').classList.toggle('hidden',!G.isHost);
   var lr=$('#lobbyRules'); if(lr&&st.cfg) lr.textContent=rulesSummary(st.cfg);
@@ -2260,12 +2551,13 @@ function updateHUD(){
     if(p.role==='seeker') mood('seeker');
     else if(p.id===st.imposterId&&st.imposterEligible&&st.mission&&st.mission.active) mood('imposter');
     else {
-      var danger=false;
-      Object.keys(st.players).forEach(function(id){
-        var q=st.players[id];
-        if(q.role==='seeker'&&q.lat!=null&&p.lat!=null&&metersBetween(p,q)<70) danger=true;
-      });
+      var here=G.pos?{id:p.id,lat:G.pos.lat,lng:G.pos.lng}:p;
+      var near=nearestSeeker(st.players,here);
+      var danger=CFG.nearWarn>0&&near<=CFG.nearWarn;
       mood(danger?'danger':'calm');
+      // a buzz you can feel through a pocket, not so often it stops meaning anything
+      if(danger&&now()-(G._nearBuzz||0)>5000){ G._nearBuzz=now(); buzz([40,70,40]); }
+      if(!danger) G._nearBuzz=0;
     }
   }
 }
@@ -2361,12 +2653,20 @@ function logicTick(){
     drainEvents();
     route();
     if(CUR==='s-match') updateHUD();
+    powerTick();
     if(now()-lastUpkeep>5000){ lastUpkeep=now(); streetsUpkeep(); keepAwake(); }
     keepAwake(G.st.phase!=='RESULTS');
   }
   setTimeout(logicTick,250);
 }
-function frame(){ if(CUR==='s-match') renderMap(); requestAnimationFrame(frame); }
+function frame(){
+  if(CUR==='s-match'){
+    // dimmed means pocketed: one lazy frame a second instead of sixty
+    if(!POWER.dim) renderMap();
+    else if(now()-POWER.lastFrame>1000){ POWER.lastFrame=now(); renderMap(); }
+  }
+  requestAnimationFrame(frame);
+}
 
 /* ---------- creating / joining ---------- */
 function leaveRoom(){
@@ -2404,7 +2704,7 @@ function createGame(solo){
   p.lat=centre.lat;p.lng=centre.lng;p.locT=now();p.online=now();
   G.st.players[G.me.id]=p;
   G.view={lat:centre.lat,lng:centre.lng,mpp:1.2};
-  G.joinLink=G.mode==='net'?buildJoinLink(location.href,code,G.mp):'';
+  G.joinLink=G.mode==='net'?buildJoinLink(location.href,code,usingBuiltInMp()?null:G.mp):'';
   fetchStreets(centre,Math.max(400,cfg.areaR+200),false);
   if(solo){ for(var i=0;i<5;i++) addBot(G.st); }
   if(G.mode==='net') netClearInputs(code).then(pushState).catch(function(e){
@@ -2432,7 +2732,7 @@ function joinGame(code){
     roleShown=rejoin&&s.phase!=='LOBBY';
     if(!G.pos) virtualStart({lat:s.zone.lat,lng:s.zone.lng});
     G.view={lat:s.zone.lat,lng:s.zone.lng,mpp:1.2};
-    G.joinLink=buildJoinLink(location.href,code,G.mp);
+    G.joinLink=buildJoinLink(location.href,code,usingBuiltInMp()?null:G.mp);
     fetchStreets({lat:s.zone.lat,lng:s.zone.lng},Math.max(400,s.cfg.areaR+200),false);
     G.flush=true;
     show(rejoin&&s.phase!=='LOBBY'?'s-match':'s-lobby');
@@ -2610,6 +2910,9 @@ function diagRows(){
     d:awake?'Holding a wake lock, so the screen will not lock mid-match and stop your GPS.'
       :!navigator.wakeLock?'This browser cannot keep the screen awake. Set your screen timeout to a few minutes before playing, or the phone will stop reporting your position.'
       :'Not held right now — it is taken while a match is running and re-taken every time you come back to the page.'});
+  var bn=batteryNote(45);
+  if(bn) rows.push({s:bn.s,t:'Battery',d:bn.t+' The screen is held on for the whole match, so it '+
+    'drops faster than usual. Pocketing the phone dims it automatically after a minute.'});
   var ns=netStatus();
   rows.push({s:NET.kind==='none'?'warn':ns.s,t:'Multiplayer',
     d:NET.kind==='none'?'No transport set up. Create game will only offer solo play — open Multiplayer setup to connect a Supabase project.'
@@ -2781,6 +3084,9 @@ var SETUP=[
    fmt:function(v){return v===0?'never':v+'×';},h:'How many times the safe circle shrinks and relocates.'},
   {k:'zoneShrink',t:'Shrink per move',type:'range',min:0.4,max:0.95,step:0.05,
    fmt:function(v){return Math.round(v*100)+'%';},h:'Each new circle is this fraction of the last one.'},
+  {k:'nearWarn',t:'Warn when a seeker is near',type:'seg',opts:[[0,'Off'],[40,'Close'],[70,'Normal']],
+   h:'Buzzes your phone and reddens the screen edge when a seeker gets this close. It does not '+
+     'show you where they are — only that you should move. Off makes hiding much tenser.'},
   {k:'hiderSight',t:'Hiders see each other',type:'seg',opts:[[1,'On'],[0,'Off']],
    h:'On: hiders see other hiders on the map by name, so you can regroup and it is obvious '+
      'who is left. Off: every hider is on their own — but the imposter can still see everyone, '+
@@ -2965,7 +3271,7 @@ function withCanvas(pctx,w,h,view,fn,dpr){
   try{ fn(); } finally { ctx=oc; VW=ow; VH=oh; G.view=ov; DPR=od; }
 }
 var PV_MODE={matchLen:'area',areaR:'area',scatter:'run',catchRadius:'catch',gpsForgive:'catch',
-  conversion:'run',trackScale:'signal',trackRate:'signal',hiderSight:'area',
+  conversion:'run',trackScale:'signal',trackRate:'signal',hiderSight:'area',nearWarn:'catch',
   zoneStages:'zones',zoneShrink:'zones',
   imposters:'area',tribunals:'area',fullSignal:'run',objectives:'area',mapStyle:'area'};
 function pvRing(c,r,col,dash,width){
@@ -3143,6 +3449,9 @@ function boot(){
   };
   $('#b-create').onclick=function(){ SFX.tap(); buildSetup();
     if(G.pos) fetchStreets({lat:G.pos.lat,lng:G.pos.lng},Math.max(400,G.cfg.areaR+200),false);
+    var bn=batteryNote((G.cfg.matchLen||2700)/60);
+    var bl=$('#createBatt');
+    if(bl){ bl.textContent=bn?bn.t:''; bl.style.color=bn&&bn.s==='warn'?'var(--amber)':'var(--dim)'; }
     $('#createLoc').textContent=G.gps==='ok'?'Using your current location as the centre of the play area.'
       :(G.gps==='weak'?'GPS is weak here — the centre may be off by a few metres.'
         :'Waiting for GPS — if it never arrives the game runs in simulated mode so you can still test.');
@@ -3193,6 +3502,10 @@ function boot(){
   $('#devtab').onclick=function(){ $('#dev').classList.toggle('show'); };
   $('#codeInput').addEventListener('input',function(){ this.value=this.value.toUpperCase(); });
 
+  ['pointerdown','touchstart','keydown'].forEach(function(ev){
+    document.addEventListener(ev,touched,{passive:true});
+  });
+  watchBattery();
   document.addEventListener('visibilitychange',function(){ if(!document.hidden) onResume(); });
   window.addEventListener('focus',onResume);
   window.addEventListener('pageshow',onResume);

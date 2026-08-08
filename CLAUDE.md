@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  266 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  292 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -78,6 +78,16 @@ Break any of these and the game stops making sense:
   outside the zone still exposes you with signals off — that is the punishment for it, not a
   tracking feature.
 - Blips are approximate and tighten over the match; they never pin a hider exactly.
+- The join link omits the connection when the page already carries it in `MP_DEFAULT`. That is
+  what keeps it short enough for a scannable QR code; a link that has to carry a connection is
+  ~290 characters and `qrEncode` correctly returns null rather than emitting something no camera
+  will resolve.
+- `qrEncode` is written out in CORE because this project has no dependencies. It is checked
+  against the spec's own Reed-Solomon generator polynomials and by decoding its format bits back
+  out — structural tests alone would not catch a field-arithmetic bug.
+- Holding the screen awake is what actually flattens a phone. `powerTick` drops to a nearly black
+  screen and one frame a second after `CFG.dimAfter` untouched, but never while a catch is one tap
+  away or an alert is up.
 - Canvases are sized to `window.devicePixelRatio` (up to 3x) and tile zoom is chosen for that
   density, not for CSS pixels. Drawing the map through a reduced-size buffer, or capping the
   backing store below the screen, is what made it look soft — a smoke test pins the preview's
@@ -102,7 +112,8 @@ Break any of these and the game stops making sense:
 
 ## Current state
 
-Working: host pause/resume and end-early, host migration, a wake lock that survives
+Working: a scannable QR join code, low-power screen, seeker-proximity warning,
+host pause/resume and end-early, host migration, a wake lock that survives
 backgrounding, on-map guidance to the safe zone, profile and 12 procedural characters, room-code lobby over Supabase with a shareable
 join link, mid-match rejoin, dropped-phone handling, roles, scatter, real-street map with a
 walkable road graph driving objective and lure placement and bot movement, smooth character
@@ -173,7 +184,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           266 core tests + 7 smoke runs
+npm test           292 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

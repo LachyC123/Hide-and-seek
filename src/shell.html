@@ -124,6 +124,14 @@ input:focus{outline:none;border-color:var(--accent)}
 /* multiplayer setup */
 /* body sets user-select:none for the game; these have to opt back in, and iOS only
    honours the -webkit- form — without it the block cannot be selected by hand at all */
+/* low power: almost no lit pixels, but still answers "what am I and how long left" */
+#lowpower{position:fixed;inset:0;z-index:94;background:#000;display:flex;
+  flex-direction:column;align-items:center;justify-content:center;gap:6px}
+#lowpower.hidden{display:none}
+#lowpower h1{font-size:26px;margin:0;color:#4a4458;letter-spacing:.12em}
+#lowpower p{margin:0;color:#3a3546;font-size:13px}
+#lowpower .tiny{color:#2e2a3a}
+
 /* paused overlay: has to be unmistakable from a pocket's distance */
 #paused{position:fixed;inset:0;z-index:96;background:#0b0916f2;display:flex;
   flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:28px;
@@ -137,6 +145,10 @@ input:focus{outline:none;border-color:var(--accent)}
   padding:10px;margin:6px 0 0;white-space:pre;overflow:auto;max-height:200px;
   -webkit-user-select:all;user-select:all;
   box-shadow:inset 0 0 0 2px #ffffff14}
+#lobbyQRWrap{display:flex;justify-content:center;margin:10px 0 4px}
+#lobbyQRWrap.hidden{display:none}
+#lobbyQR{display:block;image-rendering:pixelated;box-shadow:0 0 0 6px #f2ecdf}
+
 .linkbox{background:var(--deep);font:11px/1.4 ui-monospace,Menlo,monospace;color:var(--cream);
   padding:10px;margin:6px 0 8px;word-break:break-all;
   -webkit-user-select:all;user-select:all;
@@ -302,6 +314,7 @@ input:focus{outline:none;border-color:var(--accent)}
     <div class="panel">
       <div class="tiny">Play area centre</div>
       <p id="createLoc" style="margin:6px 0 0">Using your current location as the centre of the map.</p>
+      <p id="createBatt" class="tiny" style="margin:8px 0 0;letter-spacing:.04em;text-transform:none;font-size:11px"></p>
     </div>
     <div style="height:8px"></div>
     <button class="btn" id="b-create-go">Create lobby</button>
@@ -388,7 +401,8 @@ input:focus{outline:none;border-color:var(--accent)}
     <div class="code" id="lobbyCode">-----</div>
     <p class="tiny" style="margin-top:0">Share this code · <span id="lobbyCount">1 player</span></p>
     <div class="panel hidden" id="lobbyLinkPanel">
-      <div class="tiny">Join link — everything included</div>
+      <div class="tiny">Point a camera at this to join</div>
+      <div id="lobbyQRWrap" class="hidden"><canvas id="lobbyQR"></canvas></div>
       <p id="lobbyLink" class="linkbox">—</p>
       <button class="btn dark small" id="b-copy-link">Copy join link</button>
     </div>
@@ -501,6 +515,12 @@ input:focus{outline:none;border-color:var(--accent)}
 
 <div id="edge"></div>
 <div id="alert"><div class="sub" id="alertSub"></div><h1 id="alertTitle"></h1><p id="alertBody"></p></div>
+<div id="lowpower" class="hidden">
+  <div class="tiny">Saving battery</div>
+  <h1 id="lpRole">HIDER</h1>
+  <p class="mono" id="lpTime">--:--</p>
+  <p class="tiny">Tap anywhere for the map</p>
+</div>
 <div id="paused" class="hidden">
   <div class="tiny">Match paused</div>
   <h1>STAND STILL</h1>

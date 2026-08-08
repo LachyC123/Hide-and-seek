@@ -884,6 +884,79 @@ t('connection details survive characters that need escaping',()=>{
   const mp={url:'https://a-b.supabase.co',key:'ab+/=cd'.repeat(6)};
   return eq(C.decodeMpConfig(C.encodeMpConfig(mp)).key,mp.key);});
 
+/* ---- QR codes ---- */
+t('the Reed-Solomon generator matches the published polynomial',()=>{
+  // degree 10 is in the spec's own table; if this is right the field maths is right
+  const want=[1,216,194,159,111,199,94,95,113,157,193];
+  return eq(C.rsGenerator(10).join(','),want.join(','));});
+t('the degree 16 generator matches too',()=>{
+  const g=C.rsGenerator(16);
+  return ok(g.length===17&&g[0]===1&&g[16]===59,'got '+g.join(','));});
+t('format bits carry the mask back out again',()=>{
+  // the 15 bits are a BCH code; unmasking and shifting must return what went in
+  for(let mask=0;mask<8;mask++){
+    const f=C.qrFormatBits(0,mask)^0x5412;
+    if((f>>>10)!==mask) throw new Error('mask '+mask+' did not survive the encoding');
+  }
+  return true;});
+t('text is measured in bytes, not characters',()=>
+  ok(C.utf8Bytes('abc').length===3&&C.utf8Bytes('é').length===2&&C.utf8Bytes('🙂').length===4));
+t('a room link fits in a small, scannable code',()=>{
+  const q=C.qrEncode('https://me.github.io/Hide-and-seek/#room=K7P2Q');
+  return ok(q&&q.version<=4,'needed version '+(q&&q.version));});
+t('the grid is the size the version says it is',()=>{
+  const q=C.qrEncode('hello');
+  return ok(q.size===17+4*q.version&&q.modules.length===q.size&&
+            q.modules[0].length===q.size);});
+t('all three finder patterns are where a scanner looks for them',()=>{
+  const q=C.qrEncode('hello'),m=q.modules,n=q.size;
+  const finder=(r,c)=>m[r][c]&&m[r+6][c]&&m[r][c+6]&&m[r+6][c+6]&&
+                      !m[r+1][c+1]&&m[r+2][c+2]&&m[r+3][c+3];
+  return ok(finder(0,0)&&finder(0,n-7)&&finder(n-7,0));});
+t('the timing patterns alternate all the way across',()=>{
+  const q=C.qrEncode('hello'),m=q.modules,n=q.size;
+  for(let i=8;i<n-8;i++){
+    if(m[6][i]!==(i%2===0?1:0)) throw new Error('row timing broken at '+i);
+    if(m[i][6]!==(i%2===0?1:0)) throw new Error('column timing broken at '+i);
+  }
+  return true;});
+t('the dark module the spec insists on is set',()=>{
+  const q=C.qrEncode('hello');
+  return eq(q.modules[q.size-8][8],1);});
+t('every module ends up as a 0 or a 1, never undefined',()=>{
+  const q=C.qrEncode('https://me.github.io/Hide-and-seek/#room=K7P2Q');
+  for(let r=0;r<q.size;r++) for(let c=0;c<q.size;c++)
+    if(q.modules[r][c]!==0&&q.modules[r][c]!==1)
+      throw new Error('module '+r+','+c+' is '+q.modules[r][c]);
+  return true;});
+t('the same text always produces the same code',()=>{
+  const a=C.qrEncode('same text here'),b=C.qrEncode('same text here');
+  return eq(JSON.stringify(a.modules),JSON.stringify(b.modules));});
+t('different text produces a different code',()=>{
+  const a=C.qrEncode('one'),b=C.qrEncode('two');
+  return ok(JSON.stringify(a.modules)!==JSON.stringify(b.modules));});
+t('the mask chosen is a real one',()=>{
+  const q=C.qrEncode('hello');
+  return ok(q.mask>=0&&q.mask<=7);});
+t('a moderately long link still encodes',()=>
+  ok(C.qrEncode('https://me.github.io/Hide-and-seek/#room=K7P2Q&'+'x'.repeat(120))!==null));
+t('text too big for any supported version is refused, not mangled',()=>
+  eq(C.qrEncode('x'.repeat(400)),null));
+t('an empty string still makes a valid code',()=>{
+  const q=C.qrEncode('');
+  return ok(q&&q.size===21);});
+t('a link with a whole connection baked in is too big to scan, and admits it',()=>{
+  // rather than emitting something a phone camera will never resolve
+  const mp={url:'https://abc.supabase.co',key:'e'.repeat(220)};
+  return eq(C.qrEncode(C.buildJoinLink('https://x.io/','ABCDE',mp)),null);});
+t('a link leaning on the built-in connection scans easily',()=>{
+  const q=C.qrEncode(C.buildJoinLink('https://x.io/','ABCDE',null));
+  return ok(q&&q.version<=3,'needed version '+(q&&q.version));});
+t('two identical connections are recognised as the same one',()=>{
+  const a={url:'https://abc.supabase.co/rest/v1/',key:'k'.repeat(40)};
+  const b={url:'https://abc.supabase.co',key:'k'.repeat(40)};
+  return ok(C.sameMp(a,b)&&!C.sameMp(a,{url:b.url,key:'j'.repeat(40)})&&!C.sameMp(a,null));});
+
 /* ---- who can see whom ---- */
 const vSeeker={id:'s1',role:'seeker'}, vSeeker2={id:'s2',role:'seeker'};
 const vHider={id:'h1',role:'hider'}, vHider2={id:'h2',role:'hider'};
@@ -925,6 +998,32 @@ t('hiders seeing each other never leaks who the imposter is',()=>{
   const asHider=withSight(1,()=>C.sees(vHider,vHider2,room(),0));
   const asImp=withSight(1,()=>C.sees(vHider,{id:'i1',role:'imposter'},room(),0));
   return eq(asHider,asImp);});
+
+/* ---- knowing a seeker is close ---- */
+const at=(dx)=>{const p=C.offsetLatLng(O,dx,0);return {lat:p.lat,lng:p.lng};};
+t('the nearest seeker is the one that counts, not the first one found',()=>{
+  const players={far:Object.assign({id:'far',role:'seeker'},at(200)),
+                 near:Object.assign({id:'near',role:'seeker'},at(30))};
+  const d=C.nearestSeeker(players,{id:'me',lat:O.lat,lng:O.lng});
+  return ok(Math.abs(d-30)<2,'got '+d);});
+t('other hiders are not mistaken for seekers',()=>{
+  const players={h:Object.assign({id:'h',role:'hider'},at(5))};
+  return eq(C.nearestSeeker(players,{id:'me',lat:O.lat,lng:O.lng}),Infinity);});
+t('a caught seeker-to-be does not set off the warning yet',()=>{
+  const players={c:Object.assign({id:'c',role:'seeker',caught:true},at(5))};
+  return eq(C.nearestSeeker(players,{id:'me',lat:O.lat,lng:O.lng}),Infinity);});
+t('you are never your own nearest seeker',()=>{
+  const players={me:{id:'me',role:'seeker',lat:O.lat,lng:O.lng}};
+  return eq(C.nearestSeeker(players,{id:'me',lat:O.lat,lng:O.lng}),Infinity);});
+t('a seeker who has not reported a position cannot trigger a warning',()=>{
+  const players={s:{id:'s',role:'seeker',lat:null,lng:null}};
+  return eq(C.nearestSeeker(players,{id:'me',lat:O.lat,lng:O.lng}),Infinity);});
+t('with no fix of your own there is nothing to measure',()=>
+  eq(C.nearestSeeker({s:{id:'s',role:'seeker',lat:O.lat,lng:O.lng}},{id:'me',lat:null}),Infinity));
+t('the warning distance is a host setting and is clamped',()=>
+  ok(C.sanitiseCfg({nearWarn:0}).nearWarn===0&&
+     C.sanitiseCfg({nearWarn:999}).nearWarn===150&&
+     C.sanitiseCfg({}).nearWarn===70));
 
 /* ---- how often seekers get a signal ---- */
 t('the normal rate is the rate the match was always tuned to',()=>

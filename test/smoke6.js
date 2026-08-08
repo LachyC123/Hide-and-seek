@@ -98,12 +98,18 @@ setTimeout(()=>{
     if(w2.document.querySelector('.modal'))
       errs.push('shipped build asked for multiplayer setup despite a baked-in connection');
     const link=q2('#lobbyLink').textContent;
-    if(link.indexOf('#room=')<0||link.indexOf('mp=')<0)
-      errs.push('shipped build produced no usable join link: '+link);
+    if(link.indexOf('#room=')<0) errs.push('shipped build produced no usable join link: '+link);
+    // the page already carries the connection, so repeating it would only make the link
+    // too long to put in a QR code for no benefit
+    if(link.indexOf('mp=')>=0)
+      errs.push('link repeats a connection the page already has: '+link.length+' chars');
+    if(link.length>120) errs.push('join link is too long to scan: '+link.length+' chars');
+    if(q2('#lobbyQRWrap').classList.contains('hidden'))
+      errs.push('no QR code was drawn for a short join link');
     console.log('\nFALSE SAFE — the shipped build is pre-connected');
     console.log('─'.repeat(38));
     console.log('  · create game went straight to: '+shipped);
-    console.log('  · join link handed out: '+(link.length>40?'yes ('+link.length+' chars)':link));
+    console.log('  · join link handed out: '+link.length+' chars, with a scannable QR code');
     if(errs.length){ console.log('\n  ERRORS:'); errs.forEach(e=>console.log('   ! '+e)); }
     else console.log('\n  no runtime errors');
     process.exit(errs.length?1:0);
