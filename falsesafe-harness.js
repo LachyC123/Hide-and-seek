@@ -1,0 +1,482 @@
+/* FALSE SAFE — headless test harness. Extracts CORE from game.js and tests pure logic. */
+const fs=require('fs'), vm=require('vm');
+const src=fs.readFileSync(__dirname+'/game.js','utf8');
+const a=src.indexOf('CORE_START'), b=src.indexOf('CORE_END');
+if(a<0||b<0){console.error('Could not extract CORE block');process.exit(1);}
+const m=[null, src.slice(src.indexOf('*/',a)+2, src.lastIndexOf('/*',b))];
+const sandbox={module:{exports:{}},console};sandbox.exports=sandbox.module.exports;
+vm.createContext(sandbox);
+vm.runInContext(m[1],sandbox,{filename:'core.js'});
+const C=sandbox.module.exports;
+
+let pass=0,fail=0,failures=[];
+function t(name,fn){try{const r=fn();if(r===false)throw new Error('returned false');pass++;}
+  catch(e){fail++;failures.push(name+' :: '+e.message);}}
+function eq(a,b,msg){if(a!==b)throw new Error((msg||'')+' expected '+JSON.stringify(b)+' got '+JSON.stringify(a));return true;}
+function ok(v,msg){if(!v)throw new Error(msg||'not truthy');return true;}
+
+const O={lat:-33.8688,lng:151.2093}; // Sydney-ish origin
+const rng=C.mulberry32(12345);
+
+/* ---- geo ---- */
+t('metersBetween zero',()=>eq(Math.round(C.metersBetween(O,O)),0));
+t('offset 100m east measures ~100m',()=>{
+  const p=C.offsetLatLng(O,100,0);return ok(Math.abs(C.metersBetween(O,p)-100)<1.5);});
+t('offset 250m north measures ~250m',()=>{
+  const p=C.offsetLatLng(O,0,250);return ok(Math.abs(C.metersBetween(O,p)-250)<2);});
+t('rng deterministic',()=>{const a=C.mulberry32(7),b=C.mulberry32(7);return eq(a(),b());});
+
+/* ---- zone ---- */
+t('next zone always contained (400 samples)',()=>{
+  const r=C.mulberry32(99);let cur={lat:O.lat,lng:O.lng,r:450};
+  for(let i=0;i<400;i++){const n=C.nextZone(r,cur);
+    if(!C.zoneContains(cur,n))throw new Error('escaped at i='+i);
+    cur=(i%5===4)?{lat:O.lat,lng:O.lng,r:450}:n;}
+  return true;});
+t('next zone shrinks',()=>{const n=C.nextZone(C.mulberry32(3),{lat:O.lat,lng:O.lng,r:400});return ok(n.r<400);});
+t('zone respects minimum radius',()=>{
+  const n=C.nextZone(C.mulberry32(3),{lat:O.lat,lng:O.lng,r:50});return ok(n.r>=C.CFG.zoneMinR-0.01);});
+t('zone centre is offset, not concentric',()=>{
+  const r=C.mulberry32(5);let moved=0;
+  for(let i=0;i<50;i++){const n=C.nextZone(r,{lat:O.lat,lng:O.lng,r:400});
+    if(C.metersBetween(O,n)>20)moved++;}
+  return ok(moved>40,'only '+moved+'/50 offset');});
+t('zone offsets spread across all quadrants',()=>{
+  const r=C.mulberry32(11);const q={};
+  for(let i=0;i<80;i++){const n=C.nextZone(r,{lat:O.lat,lng:O.lng,r:400});
+    q[(n.lat>O.lat?'N':'S')+(n.lng>O.lng?'E':'W')]=1;}
+  return eq(Object.keys(q).length,4,'quadrants covered:');});
+t('zone stage times ascending and inside match',()=>{
+  const s=C.zoneStageTimes({matchLen:2700});
+  for(let i=1;i<s.length;i++) if(s[i]<=s[i-1]) throw new Error('not ascending');
+  return ok(s[s.length-1]<C.schedule({matchLen:2700}).end);});
+
+/* ---- schedule ---- */
+t('phase order across a standard match',()=>{
+  const cfg={matchLen:2700},seen=[];
+  for(let t0=0;t0<C.CFG.scatter+C.schedule(cfg).end+10;t0+=5){
+    const p=C.phaseFor(t0,cfg); if(seen[seen.length-1]!==p) seen.push(p);}
+  return eq(seen.join('>'),'SCATTER>HUNT_1>TRIBUNAL_1>HUNT_2>FINAL_TRIBUNAL>HUNT_ENDGAME>RESULTS');});
+t('tribunal 1 near one third of match',()=>{
+  const cfg={matchLen:2700};const s=C.schedule(cfg);return ok(Math.abs(s.t1-900)<1);});
+t('final tribunal near two thirds',()=>{
+  const s=C.schedule({matchLen:2700});return ok(Math.abs(s.t2-(1800+60))<1);});
+t('scatter is the first phase at t=0',()=>eq(C.phaseFor(0,{matchLen:1800}),'SCATTER'));
+
+/* ---- roles ---- */
+t('roles: exactly one seeker and one imposter',()=>{
+  const ids=['a','b','c','d','e','f'];const r=C.assignRoles(ids,C.mulberry32(1),1);
+  const vals=Object.values(r.roles);
+  eq(vals.filter(v=>v==='seeker').length,1,'seekers');
+  eq(vals.filter(v=>v==='imposter').length,1,'imposters');
+  return eq(vals.filter(v=>v==='hider').length,4,'hiders');});
+t('roles: seeker and imposter are different players',()=>{
+  const r=C.assignRoles(['a','b','c','d'],C.mulberry32(2),1);return ok(r.seekerId!==r.imposterId);});
+t('roles: no imposter when disabled',()=>{
+  const r=C.assignRoles(['a','b','c','d'],C.mulberry32(2),0);return eq(r.imposterId,null);});
+t('roles: every player gets exactly one role',()=>{
+  const ids=['a','b','c','d','e'];const r=C.assignRoles(ids,C.mulberry32(9),1);
+  return eq(Object.keys(r.roles).sort().join(''),ids.sort().join(''));});
+t('roles vary between seeds',()=>{
+  const a=C.assignRoles(['a','b','c','d','e','f','g','h'],C.mulberry32(1),1).seekerId;
+  let diff=false;for(let s=2;s<40;s++){if(C.assignRoles(['a','b','c','d','e','f','g','h'],C.mulberry32(s),1).seekerId!==a)diff=true;}
+  return ok(diff);});
+
+/* ---- catching ---- */
+const now=1000000;
+const seeker={id:'s',role:'seeker',lat:O.lat,lng:O.lng,locT:now};
+function hiderAt(dx){const p=C.offsetLatLng(O,dx,0);return {id:'h',role:'hider',lat:p.lat,lng:p.lng,locT:now,caught:false};}
+t('catch inside radius',()=>ok(C.canCatch(seeker,hiderAt(6),now)));
+t('no catch outside radius',()=>ok(!C.canCatch(seeker,hiderAt(30),now)));
+t('no catch on stale target location',()=>{
+  const h=hiderAt(5);h.locT=now-40000;return ok(!C.canCatch(seeker,h,now));});
+t('no catch on stale seeker location',()=>{
+  const s={...seeker,locT:now-40000};return ok(!C.canCatch(s,hiderAt(5),now));});
+t('hider cannot catch',()=>{
+  const s={...seeker,role:'hider'};return ok(!C.canCatch(s,hiderAt(5),now));});
+t('cannot catch an already caught player',()=>{
+  const h=hiderAt(5);h.caught=true;return ok(!C.canCatch(seeker,h,now));});
+t('cannot catch another seeker',()=>{
+  const h=hiderAt(5);h.role='seeker';return ok(!C.canCatch(seeker,h,now));});
+t('converting seeker cannot catch',()=>{
+  const s={...seeker,converting:true};return ok(!C.canCatch(s,hiderAt(5),now));});
+t('imposter is catchable like any hider',()=>{
+  const h=hiderAt(5);h.role='imposter';return ok(C.canCatch(seeker,h,now));});
+t('cannot catch self',()=>{
+  const s={...seeker};const t2={...seeker,role:'hider'};t2.id='s';return ok(!C.canCatch(s,t2,now));});
+
+/* ---- voting ---- */
+t('majority accusation resolves',()=>{
+  const r=C.resolveVote({a:'x',b:'x',c:'x',d:'y'},['a','b','c','d']);
+  eq(r.outcome,'accuse');return eq(r.target,'x');});
+t('plurality below majority is a skip',()=>{
+  const r=C.resolveVote({a:'x',b:'y',c:'z',d:'skip'},['a','b','c','d']);return eq(r.outcome,'skip');});
+t('tie resolves to skip',()=>{
+  const r=C.resolveVote({a:'x',b:'y'},['a','b']);return eq(r.outcome,'skip');});
+t('non-voters count as skip',()=>{
+  const r=C.resolveVote({a:'x'},['a','b','c']);return eq(r.outcome,'skip');});
+t('skip majority resolves to skip',()=>{
+  const r=C.resolveVote({a:'skip',b:'skip',c:'x'},['a','b','c']);return eq(r.outcome,'skip');});
+t('correct accusation flagged correct',()=>{
+  const r=C.resolveVote({a:'imp',b:'imp',c:'x'},['a','b','c']);
+  return eq(C.voteConsequence(r,'imp',true).kind,'correct');});
+t('wrong accusation flagged wrong',()=>{
+  const r=C.resolveVote({a:'x',b:'x',c:'imp'},['a','b','c']);
+  return eq(C.voteConsequence(r,'imp',true).kind,'wrong');});
+t('accusing an already exposed imposter counts as wrong',()=>{
+  const r=C.resolveVote({a:'imp',b:'imp',c:'x'},['a','b','c']);
+  return eq(C.voteConsequence(r,'imp',false).kind,'wrong');});
+t('only uncaught non-seekers may vote',()=>{
+  const P={a:{role:'hider',caught:false},b:{role:'seeker',caught:false},
+           c:{role:'hider',caught:true},d:{role:'imposter',caught:false}};
+  return eq(C.eligibleVoters(P).sort().join(''),'ad');});
+t('full signal is longer after the final tribunal',()=>ok(C.CFG.fullSignal[2]>C.CFG.fullSignal[1]));
+
+/* ---- win conditions ---- */
+function st(players,extra){return Object.assign({players:players,imposterId:'imp',imposterEligible:true,cfg:{matchLen:2700}},extra||{});}
+t('imposter wins when last genuine hider is caught',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:true},imp:{role:'imposter',caught:false}});
+  const w=C.checkWin(s);return eq(w&&w.winner,'imposter');});
+t('no imposter win while a genuine hider survives',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:false},imp:{role:'imposter',caught:false}});
+  return eq(C.checkWin(s),null);});
+t('seekers win when everyone including imposter is caught',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:true},imp:{role:'imposter',caught:true}});
+  return eq(C.checkWin(s).winner,'seekers');});
+t('exposed imposter alone does NOT give imposter victory',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:true},imp:{role:'imposter',caught:false}},{imposterEligible:false});
+  return eq(C.checkWin(s),null);});
+t('exposed imposter surviving to the end gives hider victory',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:true},imp:{role:'imposter',caught:false}},{imposterEligible:false});
+  const T=C.CFG.scatter+C.schedule(s.cfg).end+1;
+  return eq(C.checkWin(s,T).winner,'hiders');});
+t('hiders win at time with survivors',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:false},imp:{role:'imposter',caught:true}});
+  const T=C.CFG.scatter+C.schedule(s.cfg).end+1;
+  return eq(C.checkWin(s,T).winner,'hiders');});
+t('imposter victory beats the clock',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:true},imp:{role:'imposter',caught:false}});
+  const T=C.CFG.scatter+C.schedule(s.cfg).end+1;
+  return eq(C.checkWin(s,T).winner,'imposter');});
+t('no premature win mid match',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider'},h2:{role:'hider'},imp:{role:'imposter'}});
+  return eq(C.checkWin(s,600),null);});
+t('faction counts exclude seekers and caught players',()=>{
+  const s=st({s1:{role:'seeker'},h1:{role:'hider',caught:true},h2:{role:'hider'},imp:{role:'imposter'}});
+  const c=C.factionCounts(s);
+  eq(c.uncaught.length,2);eq(c.genuine.length,1);return eq(c.impUncaught,true);});
+
+/* ---- tracking ---- */
+t('tracking tightens over the match',()=>{
+  const a=C.trackingBand(0.1),b=C.trackingBand(0.5),c=C.trackingBand(0.9);
+  return ok(a.max>b.max&&b.max>c.max&&a.every>c.every);});
+t('early blips land within early uncertainty band',()=>{
+  const r=C.mulberry32(4);
+  for(let i=0;i<200;i++){const b=C.makeBlip(r,O,0.1,false);
+    if(C.metersBetween(O,b)>200.5)throw new Error('blip too far: '+C.metersBetween(O,b));}
+  return true;});
+t('late blips are tighter than early blips on average',()=>{
+  const r=C.mulberry32(8);let e=0,l=0;
+  for(let i=0;i<300;i++){e+=C.metersBetween(O,C.makeBlip(r,O,0.1,false));l+=C.metersBetween(O,C.makeBlip(r,O,0.9,false));}
+  return ok(l<e*0.6);});
+t('jammer widens uncertainty',()=>{
+  const r=C.mulberry32(6);let n=0,j=0;
+  for(let i=0;i<200;i++){n+=C.makeBlip(r,O,0.9,false).r;j+=C.makeBlip(r,O,0.9,true).r;}
+  return ok(j>n*1.5);});
+
+/* ---- zone pressure ---- */
+t('inside zone is never outside',()=>{
+  const p=C.offsetLatLng(O,50,0);
+  return eq(C.outsideState({lat:p.lat,lng:p.lng},{lat:O.lat,lng:O.lng,r:200},now).outside,false);});
+t('just outside gives grace, not punishment',()=>{
+  const p=C.offsetLatLng(O,260,0);
+  const s=C.outsideState({lat:p.lat,lng:p.lng,outsideSince:now-5000},{lat:O.lat,lng:O.lng,r:200},now);
+  return ok(s.outside&&s.level===0);});
+t('staying outside escalates exposure',()=>{
+  const p=C.offsetLatLng(O,260,0);
+  const s1=C.outsideState({lat:p.lat,lng:p.lng,outsideSince:now-60000},{lat:O.lat,lng:O.lng,r:200},now);
+  const s2=C.outsideState({lat:p.lat,lng:p.lng,outsideSince:now-160000},{lat:O.lat,lng:O.lng,r:200},now);
+  return ok(s1.level===1&&s2.level===2);});
+t('gps slop near the boundary is forgiven',()=>{
+  const p=C.offsetLatLng(O,208,0);
+  return eq(C.outsideState({lat:p.lat,lng:p.lng},{lat:O.lat,lng:O.lng,r:200},now).outside,false);});
+
+/* ---- imposter missions ---- */
+t('follow mission completes when staying close',()=>{
+  const players={t1:{id:'t1',role:'hider',caught:false,lat:O.lat,lng:O.lng}};
+  const imp=C.offsetLatLng(O,10,0);
+  const m={type:'FOLLOW',targetId:'t1',need:30,progress:0};
+  let done=false;for(let i=0;i<40;i++){done=C.missionTick(m,imp,players,1).done;if(done)break;}
+  return ok(done);});
+t('follow mission decays when target is far',()=>{
+  const players={t1:{id:'t1',role:'hider',caught:false,lat:O.lat,lng:O.lng}};
+  const near=C.offsetLatLng(O,10,0),far=C.offsetLatLng(O,300,0);
+  const m={type:'FOLLOW',targetId:'t1',need:30,progress:0};
+  for(let i=0;i<10;i++)C.missionTick(m,near,players,1);
+  const peak=m.progress;
+  for(let i=0;i<10;i++)C.missionTick(m,far,players,1);
+  return ok(m.progress<peak&&m.progress>=0);});
+t('follow mission fails if target is caught',()=>{
+  const players={t1:{id:'t1',role:'hider',caught:true,lat:O.lat,lng:O.lng}};
+  const m={type:'FOLLOW',targetId:'t1',need:30,progress:0};
+  return eq(C.missionTick(m,C.offsetLatLng(O,5,0),players,1).active,false);});
+t('lure mission completes at the marked spot',()=>{
+  const m={type:'LURE',lat:O.lat,lng:O.lng,need:15,progress:0};
+  let done=false;for(let i=0;i<20;i++){done=C.missionTick(m,{lat:O.lat,lng:O.lng},{},1).done;if(done)break;}
+  return ok(done);});
+t('mission target is never the imposter',()=>{
+  const s={players:{imp:{role:'imposter'},h1:{role:'hider'}},imposterId:'imp',imposterEligible:true,
+    zone:{lat:O.lat,lng:O.lng,r:300}};
+  for(let i=0;i<40;i++){const m=C.pickMission(C.mulberry32(i),s);
+    if(m.type==='FOLLOW'&&m.targetId==='imp')throw new Error('targeted self');}
+  return true;});
+t('mission falls back to LURE with no valid targets',()=>{
+  const s={players:{imp:{role:'imposter'},s1:{role:'seeker'}},imposterId:'imp',imposterEligible:true,
+    zone:{lat:O.lat,lng:O.lng,r:300}};
+  return eq(C.pickMission(C.mulberry32(1),s).type,'LURE');});
+t('lure spot is inside the safe zone',()=>{
+  const s={players:{imp:{role:'imposter'}},imposterId:'imp',imposterEligible:true,zone:{lat:O.lat,lng:O.lng,r:300}};
+  for(let i=0;i<50;i++){const m=C.pickMission(C.mulberry32(i),s);
+    if(m.type==='LURE'&&C.metersBetween(O,m)>300)throw new Error('outside zone');}
+  return true;});
+
+
+/* ---- settings sanitising ---- */
+t('sanitiseCfg clamps a silly match length',()=>{
+  const c=C.sanitiseCfg({matchLen:999999});return eq(c.matchLen,5400);});
+t('sanitiseCfg clamps catch distance',()=>{
+  eq(C.sanitiseCfg({catchRadius:400}).catchRadius,30);
+  return eq(C.sanitiseCfg({catchRadius:1}).catchRadius,5);});
+t('sanitiseCfg keeps a sane head start relative to match length',()=>{
+  const c=C.sanitiseCfg({matchLen:600,scatter:600});return ok(c.scatter<=240);});
+t('sanitiseCfg allows zero zone moves, votes and imposters',()=>{
+  const c=C.sanitiseCfg({zoneStages:0,tribunals:0,imposters:0});
+  eq(c.zoneStages,0);eq(c.tribunals,0);return eq(c.imposters,0);});
+t('sanitiseCfg rejects an unknown map style',()=>eq(C.sanitiseCfg({mapStyle:'hologram'}).mapStyle,'real'));
+t('applyCfg changes live behaviour then resets',()=>{
+  C.applyCfg(C.sanitiseCfg({catchRadius:25,tribunals:1}));
+  const wide=C.CFG.catchRadius, tri=C.CFG.tribunals;
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(wide===25&&tri===1&&C.CFG.catchRadius===10&&C.CFG.tribunals===2);});
+t('one tribunal is scheduled at halfway',()=>{
+  C.applyCfg(C.sanitiseCfg({tribunals:1}));
+  const s=C.schedule({matchLen:1800});
+  const r=(s.marks.length===1&&Math.abs(s.marks[0]-900)<1&&Math.abs(s.end-1860)<1);
+  C.applyCfg(C.sanitiseCfg({}));return ok(r);});
+t('zero tribunals means the match is pure hunt time',()=>{
+  C.applyCfg(C.sanitiseCfg({tribunals:0}));
+  const s=C.schedule({matchLen:1800});
+  const r=(s.marks.length===0&&s.end===1800&&C.phaseFor(C.CFG.scatter+1000,{matchLen:1800})==='HUNT_1');
+  C.applyCfg(C.sanitiseCfg({}));return ok(r);});
+t('two tribunals still produce the standard phase order',()=>{
+  const cfg={matchLen:2700},seen=[];
+  for(let x=0;x<C.CFG.scatter+C.schedule(cfg).end+10;x+=5){
+    const p=C.phaseFor(x,cfg); if(seen[seen.length-1]!==p) seen.push(p);}
+  return eq(seen.join('>'),'SCATTER>HUNT_1>TRIBUNAL_1>HUNT_2>FINAL_TRIBUNAL>HUNT_ENDGAME>RESULTS');});
+t('tighter signal setting shrinks blip uncertainty',()=>{
+  const r1=C.mulberry32(3);let a=0;for(let i=0;i<200;i++)a+=C.makeBlip(r1,O,0.5,false).r;
+  C.applyCfg(C.sanitiseCfg({trackScale:0.6}));
+  const r2=C.mulberry32(3);let b=0;for(let i=0;i<200;i++)b+=C.makeBlip(r2,O,0.5,false).r;
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(b<a*0.7);});
+
+/* ---- GPS allowance on catching ---- */
+t('catch distance grows with poor accuracy',()=>{
+  const d=C.catchDistance({acc:40},{acc:40},10);return ok(d>10&&d<=25);});
+t('catch distance is unchanged with good accuracy',()=>eq(C.catchDistance({acc:5},{acc:6},10),10));
+t('catch allowance is capped',()=>ok(C.catchDistance({acc:400},{acc:400},10)<=10+C.CFG.catchSlopMax));
+t('strict mode ignores accuracy entirely',()=>{
+  C.applyCfg(C.sanitiseCfg({gpsForgive:0}));
+  const d=C.catchDistance({acc:60},{acc:60},10);
+  C.applyCfg(C.sanitiseCfg({}));return eq(d,10);});
+t('a marginal tag succeeds with allowance and fails without',()=>{
+  const p=C.offsetLatLng(O,16,0);
+  const s={id:'s',role:'seeker',lat:O.lat,lng:O.lng,locT:now,acc:35};
+  const h={id:'h',role:'hider',caught:false,lat:p.lat,lng:p.lng,locT:now,acc:35};
+  const withAllowance=C.canCatch(s,h,now);
+  C.applyCfg(C.sanitiseCfg({gpsForgive:0}));
+  const strict=C.canCatch(s,h,now);
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(withAllowance&&!strict);});
+
+/* ---- GPS filter ---- */
+t('filter accepts the first fix as-is',()=>{
+  const f=C.makeGpsFilter();const p=f.push({lat:O.lat,lng:O.lng,acc:12,t:1000});
+  return ok(Math.abs(C.metersBetween(p,O))<0.01);});
+t('filter rejects a junk fix',()=>{
+  const f=C.makeGpsFilter();f.push({lat:O.lat,lng:O.lng,acc:8,t:1000});
+  const jump=C.offsetLatLng(O,180,0);
+  const p=f.push({lat:jump.lat,lng:jump.lng,acc:180,t:2000});
+  return ok(C.metersBetween(p,O)<5&&f.rejected===1);});
+t('filter rejects a teleport no runner could make',()=>{
+  const f=C.makeGpsFilter();f.push({lat:O.lat,lng:O.lng,acc:8,t:1000});
+  const jump=C.offsetLatLng(O,300,0);
+  f.push({lat:jump.lat,lng:jump.lng,acc:10,t:2000});
+  return eq(f.rejected,1);});
+t('filter converges on a steady real position',()=>{
+  const f=C.makeGpsFilter();const truth=C.offsetLatLng(O,40,0);
+  let p;for(let i=0;i<30;i++){
+    const noise=C.offsetLatLng(truth,(Math.sin(i*3)*12),(Math.cos(i*5)*12));
+    p=f.push({lat:noise.lat,lng:noise.lng,acc:14,t:1000+i*1000});}
+  return ok(C.metersBetween(p,truth)<9,'off by '+C.metersBetween(p,truth));});
+t('filter smooths jitter better than raw fixes',()=>{
+  const truth=C.offsetLatLng(O,40,0);const f=C.makeGpsFilter();
+  let rawErr=0,fErr=0,p;
+  for(let i=0;i<40;i++){
+    const noise=C.offsetLatLng(truth,Math.sin(i*2.3)*15,Math.cos(i*1.7)*15);
+    rawErr+=C.metersBetween(noise,truth);
+    p=f.push({lat:noise.lat,lng:noise.lng,acc:15,t:1000+i*1000});
+    fErr+=C.metersBetween(p,truth);}
+  return ok(fErr<rawErr*0.75,'filtered '+Math.round(fErr)+' vs raw '+Math.round(rawErr));});
+t('filter still follows a real walk',()=>{
+  const f=C.makeGpsFilter();let cur=O,p;
+  for(let i=0;i<40;i++){
+    cur=C.offsetLatLng(cur,1.4,0);
+    p=f.push({lat:cur.lat,lng:cur.lng,acc:10,t:1000+i*1000});}
+  return ok(C.metersBetween(p,cur)<12,'lagging '+C.metersBetween(p,cur));});
+t('filter recovers after a long dropout',()=>{
+  const f=C.makeGpsFilter();f.push({lat:O.lat,lng:O.lng,acc:8,t:1000});
+  const far=C.offsetLatLng(O,600,0);
+  const p=f.push({lat:far.lat,lng:far.lng,acc:70,t:60000});
+  return ok(C.metersBetween(p,O)>100);});
+t('gps quality labels step down with accuracy',()=>{
+  return ok(C.gpsQuality(6).level===3&&C.gpsQuality(20).level===2&&
+            C.gpsQuality(50).level===1&&C.gpsQuality(200).level===0);});
+
+/* ---- map tile maths ---- */
+t('tile x/y round-trips back to the same coordinates',()=>{
+  const z=17,x=C.lon2tile(O.lng,z),y=C.lat2tile(O.lat,z);
+  const lng=C.tile2lon(x,z),lat=C.tile2lat(y,z);
+  return ok(Math.abs(lat-O.lat)<1e-6&&Math.abs(lng-O.lng)<1e-6);});
+t('tile indices stay inside the world at every zoom',()=>{
+  for(let z=14;z<=19;z++){
+    const x=C.lon2tile(179.9,z),y=C.lat2tile(-84,z),n=Math.pow(2,z);
+    if(x<0||x>n||y<0||y>n) throw new Error('out of range at z'+z);}
+  return true;});
+t('zoom is chosen so tiles are at least as sharp as the view',()=>{
+  [0.4,1,2,3].forEach(mpp=>{
+    const z=C.zoomForMpp(O.lat,mpp);
+    if(C.tileMpp(O.lat,z)>mpp*1.6) throw new Error('too coarse at mpp '+mpp);});
+  return true;});
+t('zoom is clamped to sane tile levels',()=>{
+  return ok(C.zoomForMpp(O.lat,0.01)===19&&C.zoomForMpp(O.lat,500)===14);});
+t('metres per pixel halves as zoom increases',()=>
+  ok(Math.abs(C.tileMpp(O.lat,17)-C.tileMpp(O.lat,16)/2)<1e-9));
+
+
+/* ---- settings preview: real-world scale ---- */
+t('walking time matches a sane human pace',()=>{
+  const m=C.walkMins(450*2);return ok(m>9&&m<13,'got '+m.toFixed(1)+' min');});
+t('a 60 second head start is roughly a couple of hundred metres',()=>{
+  const d=C.runDistance(60);return ok(d>150&&d<250,'got '+d);});
+t('car lengths convert sensibly',()=>ok(Math.abs(C.carLengths(22)-4.9)<0.2));
+t('short distances read as steps, long ones as walking minutes',()=>{
+  return ok(/steps/.test(C.paceText(15))&&/min walk/.test(C.paceText(900)));});
+t('zone plan has one radius per stage plus the start',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneStages:5}));
+  const p=C.zonePlan({areaR:450});
+  C.applyCfg(C.sanitiseCfg({}));
+  return eq(p.length,6);});
+t('zone plan shrinks monotonically to the floor',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneStages:8,zoneShrink:0.5}));
+  const p=C.zonePlan({areaR:1500});
+  C.applyCfg(C.sanitiseCfg({}));
+  for(let i=1;i<p.length;i++) if(p[i]>p[i-1]) throw new Error('grew at '+i);
+  return ok(p[p.length-1]>=C.CFG.zoneMinR-0.01);});
+t('no zone moves means the circle never changes',()=>{
+  C.applyCfg(C.sanitiseCfg({zoneStages:0}));
+  const p=C.zonePlan({areaR:450});
+  C.applyCfg(C.sanitiseCfg({}));
+  return eq(p.length,1)&&eq(p[0],450);});
+t('preview fits the play area on screen',()=>{
+  const mpp=C.previewMpp('area',{areaR:450},340);
+  return ok(450*2/mpp<=340,'circle overflows');});
+t('preview zooms right in for catch distance',()=>{
+  const wide=C.previewMpp('area',{areaR:450},340);
+  C.applyCfg(C.sanitiseCfg({catchRadius:10}));
+  const close=C.previewMpp('catch',{areaR:450},340);
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(close<wide/10,'not zoomed enough');});
+t('catch preview keeps two runners visible at max distance',()=>{
+  C.applyCfg(C.sanitiseCfg({catchRadius:30}));
+  const mpp=C.previewMpp('catch',{},340);
+  C.applyCfg(C.sanitiseCfg({}));
+  return ok(30/mpp<170,'runners fall off screen');});
+t('preview scale never collapses for a tiny play area',()=>{
+  const mpp=C.previewMpp('area',{areaR:100},340);
+  return ok(mpp>0&&isFinite(mpp));});
+t('scale bar picks a round number that fits',()=>{
+  const b=C.scaleBarFor(1.5,140);
+  return ok([5,10,20,25,50,100,200,250,500,1000].indexOf(b.m)>=0&&b.px<=140);});
+t('scale bar shrinks its label as you zoom in',()=>{
+  const far=C.scaleBarFor(3,140).m, near=C.scaleBarFor(0.1,140).m;
+  return ok(near<far);});
+t('scale bar still returns something when very zoomed out',()=>{
+  const b=C.scaleBarFor(50,140);return ok(b.m>0&&isFinite(b.px));});
+
+
+/* ---- OpenStreetMap street data ---- */
+t('highways are classified into drawable tiers',()=>{
+  eq(C.classifyWay({highway:'motorway'}),'major');
+  eq(C.classifyWay({highway:'residential'}),'minor');
+  eq(C.classifyWay({highway:'footway'}),'path');
+  eq(C.classifyWay({building:'yes'}),'building');
+  return eq(C.classifyWay({natural:'water'}),'water');});
+t('irrelevant features are ignored',()=>{
+  return ok(C.classifyWay({amenity:'bench'})===null&&C.classifyWay(null)===null&&C.classifyWay({})===null);});
+t('parks and pitches count as green space',()=>{
+  return ok(C.classifyWay({leisure:'park'})==='park'&&C.classifyWay({landuse:'forest'})==='park');});
+t('query is bounded to the play area and the right centre',()=>{
+  const q=C.overpassQuery(O,450);
+  return ok(q.indexOf('around:450')>0&&q.indexOf(O.lat.toFixed(6))>0&&q.indexOf('out geom')>0);});
+t('query radius is capped so we never scrape a whole city',()=>
+  ok(C.overpassQuery(O,99999).indexOf('around:1600')>0));
+t('buildings are skipped for large play areas',()=>{
+  return ok(C.overpassQuery(O,400).indexOf('building')>0&&C.overpassQuery(O,1200).indexOf('building')<0);});
+const fakeOSM={elements:[
+  {type:'way',tags:{highway:'residential'},geometry:[{lat:O.lat,lon:O.lng},{lat:O.lat+0.001,lon:O.lng+0.001}]},
+  {type:'way',tags:{building:'yes'},geometry:[{lat:O.lat,lon:O.lng},{lat:O.lat,lon:O.lng+0.0005},
+    {lat:O.lat+0.0005,lon:O.lng+0.0005},{lat:O.lat,lon:O.lng}]},
+  {type:'way',tags:{amenity:'cafe'},geometry:[{lat:O.lat,lon:O.lng},{lat:O.lat,lon:O.lng+0.001}]},
+  {type:'way',tags:{highway:'footway'},geometry:[{lat:O.lat,lon:O.lng}]}
+]};
+t('parsing keeps only usable ways',()=>{
+  const w=C.parseOverpass(fakeOSM,O);return eq(w.length,2);});
+t('parsed geometry lands in metres relative to the centre',()=>{
+  const w=C.parseOverpass(fakeOSM,O)[0];
+  return ok(Math.abs(w.p[0])<0.2&&Math.abs(w.p[1])<0.2&&Math.abs(w.p[2]-92)<8&&Math.abs(w.p[3]-111)<8);});
+t('closed shapes are flagged as fillable areas',()=>{
+  const w=C.parseOverpass(fakeOSM,O);
+  return ok(w[1].a===true&&w[0].a===false);});
+t('every way carries a bounding box for culling',()=>{
+  const w=C.parseOverpass(fakeOSM,O)[0];
+  return ok(w.b[0]<=w.b[2]&&w.b[1]<=w.b[3]&&w.b.length===4);});
+t('parsing survives an empty response',()=>eq(C.parseOverpass({elements:[]},O).length,0));
+t('parsing survives junk',()=>ok(C.parseOverpass(null,O).length===0&&C.parseOverpass({},O).length===0));
+t('coordinates are rounded to keep the cache small',()=>{
+  const w=C.parseOverpass(fakeOSM,O)[0];
+  return ok(w.p.every(v=>Math.abs(v*10-Math.round(v*10))<1e-9));});
+t('culling drops ways outside the view',()=>{
+  const near={b:[0,0,10,10]},far={b:[5000,5000,5100,5100]};
+  const view=[-100,-100,100,100];
+  return ok(C.wayVisible(near,view)&&!C.wayVisible(far,view));});
+t('culling keeps a way that only clips the edge',()=>
+  ok(C.wayVisible({b:[90,90,300,300]},[-100,-100,100,100])));
+t('cache key is stable for the same area but differs elsewhere',()=>{
+  const a=C.streetsCacheKey(O,450), b=C.streetsCacheKey({lat:O.lat+0.0001,lng:O.lng},450);
+  const c=C.streetsCacheKey({lat:O.lat+0.5,lng:O.lng},450);
+  return ok(a===b&&a!==c);});
+t('cache key buckets nearby radii together',()=>
+  eq(C.streetsCacheKey(O,440),C.streetsCacheKey(O,449)));
+t('bigger roads draw wider than lanes and paths',()=>{
+  return ok(C.ROAD_STYLE('major').w>C.ROAD_STYLE('minor').w&&
+            C.ROAD_STYLE('minor').w>C.ROAD_STYLE('path').w&&
+            C.ROAD_STYLE('building')===null);});
+t('paths are dashed, roads are not',()=>
+  ok(C.ROAD_STYLE('path').dash&&!C.ROAD_STYLE('major').dash));
+
+console.log('\nFALSE SAFE — core harness');
+console.log('─'.repeat(38));
+failures.forEach(f=>console.log('  FAIL  '+f));
+console.log(`  ${pass}/${pass+fail} passing`);
+process.exit(fail?1:0);
