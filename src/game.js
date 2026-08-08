@@ -22,8 +22,9 @@ var CFG={
   scatter:180, voteLen:60, catchRadius:10, conversion:60, locFresh:25,
   fullSignal:{1:60,2:90}, zoneStages:5, zoneShrink:0.66, zoneMinR:45,
   zonePreview:150, zoneClose:45, graceOutside:45, tribunals:2,
-  missionFollowRadius:25, missionFollowTime:30, objectiveRadius:20, objectiveTime:15,
-  trackScale:1, trackRate:1, hiderSight:1, nearWarn:70, objectives:1, mapStyle:'real',
+  missionFollowRadius:35, missionFollowTime:25, objectiveRadius:25, objectiveTime:12,
+  missionDecay:0.25,   // progress ebbs slowly, so losing contact for a moment is survivable
+  trackScale:1, trackRate:1, hiderSight:1, nearWarn:0, objectives:1, mapStyle:'real',
   dimAfter:60,   // seconds untouched before the screen drops to low power
   // GPS handling
   gpsForgive:1, catchSlop:0.5, catchSlopMax:15, maxAcc:65, maxSpeed:12, gpsQ:1.6,
@@ -45,7 +46,7 @@ function clampN(v,a,b){return v<a?a:v>b?b:v;}
 function sanitiseCfg(c){
   var d={matchLen:1800,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
     fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-    hiderSight:1,nearWarn:70,objectives:1,gpsForgive:1,mapStyle:'real'};
+    hiderSight:1,nearWarn:0,objectives:1,gpsForgive:1,mapStyle:'real'};
   c=c||{};
   var o={
     matchLen:clampN(+c.matchLen||d.matchLen,600,5400),
@@ -272,6 +273,16 @@ function reachableSpot(rng,centre,radius,roads){
   var d=Math.sqrt(rng())*radius, a=rng()*Math.PI*2;
   return offsetLatLng(centre,Math.cos(a)*d,Math.sin(a)*d);
 }
+/* Where the current mission actually is, so the card and the map can agree.
+   Returns null when there is nothing to walk to. */
+function missionTarget(st){
+  if(!st||!st.mission) return null;
+  var m=st.mission;
+  if(m.type==='LURE') return {lat:m.lat,lng:m.lng,name:'the secret spot',spot:true};
+  var t=st.players[m.targetId];
+  if(!t||t.lat==null||t.caught) return null;
+  return {lat:t.lat,lng:t.lng,name:t.name,spot:false};
+}
 function missionTick(m,imp,players,dt){
   if(!m||!imp) return {active:false,done:false};
   var near=false;
@@ -281,7 +292,8 @@ function missionTick(m,imp,players,dt){
   } else {
     near=metersBetween(imp,m)<=CFG.objectiveRadius;
   }
-  if(near) m.progress=Math.min(m.need,m.progress+dt); else m.progress=Math.max(0,m.progress-dt*0.5);
+  if(near) m.progress=Math.min(m.need,m.progress+dt);
+  else m.progress=Math.max(0,m.progress-dt*CFG.missionDecay);
   return {active:near,done:m.progress>=m.need};
 }
 
@@ -1017,7 +1029,7 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   signalGap:signalGap,sees:sees,nearestSeeker:nearestSeeker,
   canCatch:canCatch,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
   factionCounts:factionCounts,checkWin:checkWin,outsideState:outsideState,pickMission:pickMission,
-  missionTick:missionTick,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
+  missionTick:missionTick,missionTarget:missionTarget,applyCfg:applyCfg,sanitiseCfg:sanitiseCfg,clampN:clampN,DEFAULTS:DEFAULTS,
   catchDistance:catchDistance,makeGpsFilter:makeGpsFilter,gpsQuality:gpsQuality,
   classifyWay:classifyWay,overpassQuery:overpassQuery,parseOverpass:parseOverpass,
   wayVisible:wayVisible,streetsCacheKey:streetsCacheKey,ROAD_STYLE:ROAD_STYLE,OVERPASS:OVERPASS,
@@ -1063,7 +1075,7 @@ var G={
   bots:[], dev:false, simMove:false,
   cfg:{matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
        fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-       hiderSight:1,objectives:1,gpsForgive:1,mapStyle:'real'},
+       hiderSight:1,nearWarn:0,objectives:1,gpsForgive:1,mapStyle:'real'},
   mp:null,               // {url,key} — Supabase project, from the join link or setup screen
   ack:0,                 // highest action seq the host has confirmed
   dropped:{},            // host-side: ids pruned from the lobby, and the row that did it
@@ -1524,8 +1536,11 @@ function newMission(st,rng){
   var m=pickMission(rng,st,roadsCtx()); if(!m) return;
   st.mission=m; st.mission.progress=0;
   var body=m.type==='FOLLOW'
-    ? 'Stay within 25 metres of '+((st.players[m.targetId]||{}).name||'them')+' for 30 seconds.\nREWARD: their area is secretly sent to the seekers.'
-    : 'Reach the purple marker and stay there for 15 seconds.\nREWARD: you earn a secret tip to send.';
+    ? 'Follow the purple arrow to '+((st.players[m.targetId]||{}).name||'them')+
+      '.\nStay inside the purple ring for '+CFG.missionFollowTime+' seconds.'+
+      '\nREWARD: their area is secretly sent to the seekers.'
+    : 'Follow the purple arrow to the secret spot.\nStand in the purple ring for '+
+      CFG.objectiveTime+' seconds.\nREWARD: you earn a secret tip to send.';
   pushEvent(st,st.imposterId,'mission','SECRET MISSION',body);
 }
 function spawnObjectives(st,rng){
@@ -2106,13 +2121,40 @@ function drawObjectives(st){
     ctx.beginPath();ctx.arc(s.x,s.y,CFG.objectiveRadius/G.view.mpp,0,6.2832);ctx.fill();
     label(s.x,s.y+14+bob,o.type==='JAMMER'?'JAMMER':'INTEL','#cfc7e0',8);
   });
-  if(st.mission&&st.mission.type==='LURE'&&G.me.id===st.imposterId){
-    var s2=toScreen(st.mission);
-    ctx.fillStyle='#a05ce0'; ctx.fillRect(s2.x-6,s2.y-6,12,12);
-    ctx.strokeStyle='rgba(160,92,224,.6)';ctx.lineWidth=2;
-    ctx.beginPath();ctx.arc(s2.x,s2.y,CFG.objectiveRadius/G.view.mpp,0,6.2832);ctx.stroke();
-    label(s2.x,s2.y+18,'SECRET SPOT','#d3b6f5',8);
+  // The imposter's mission is the one thing they must physically go and do, so it gets
+  // the clearest marker on the map: a ring you have to stand inside, and an arrow when
+  // it is off screen. Only ever drawn for the imposter themselves.
+  if(st.mission&&st.imposterEligible&&G.me.id===st.imposterId){
+    var tgt=missionTarget(st);
+    if(tgt){
+      var rad=(st.mission.type==='FOLLOW'?CFG.missionFollowRadius:CFG.objectiveRadius);
+      var s2=toScreen(tgt), rr=rad/G.view.mpp, pulse=0.45+0.25*Math.sin(now()/320);
+      ctx.fillStyle='rgba(160,92,224,.13)';
+      ctx.beginPath(); ctx.arc(s2.x,s2.y,rr,0,6.2832); ctx.fill();
+      ctx.setLineDash([7,6]); ctx.lineWidth=2.5;
+      ctx.strokeStyle='rgba(160,92,224,'+pulse+')';
+      ctx.beginPath(); ctx.arc(s2.x,s2.y,rr,0,6.2832); ctx.stroke(); ctx.setLineDash([]);
+      if(tgt.spot){ ctx.fillStyle='#a05ce0'; ctx.fillRect(s2.x-6,s2.y-6,12,12); }
+      var d2=G.pos?Math.round(metersBetween(G.pos,tgt)):null;
+      label(s2.x,s2.y+rr+14,
+        (tgt.spot?'STAND HERE':tgt.name.toUpperCase())+(d2!=null?' · '+d2+' m':''),'#d3b6f5',9);
+      pointTo(tgt,'#a05ce0',tgt.spot?'SECRET SPOT':tgt.name.toUpperCase());
+    }
   }
+}
+/* Shared by the safe-zone guide and the imposter's mission: if the thing you need to
+   reach is off screen, put an arrow at the edge pointing at it. */
+function pointTo(target,col,text){
+  if(!G.pos||!target) return;
+  var s=toScreen(target);
+  if(s.x>40&&s.x<VW-40&&s.y>60&&s.y<VH-90) return;      // already visible
+  var mx=VW/2,my=VH/2,ang=Math.atan2(s.y-my,s.x-mx),rad=Math.min(VW,VH)*0.30;
+  var ax=mx+Math.cos(ang)*rad, ay=my+Math.sin(ang)*rad;
+  ctx.save(); ctx.translate(ax,ay); ctx.rotate(ang);
+  ctx.fillStyle=col;
+  ctx.beginPath(); ctx.moveTo(13,0); ctx.lineTo(-9,-8); ctx.lineTo(-4,0); ctx.lineTo(-9,8);
+  ctx.closePath(); ctx.fill(); ctx.restore();
+  label(ax,ay+24,text+' · '+Math.round(metersBetween(G.pos,target))+' m',col,9);
 }
 function label(x,y,txt,col,size){
   ctx.font='900 '+(size||9)+'px Helvetica,Arial,sans-serif';
@@ -2490,13 +2532,28 @@ function updateHUD(){
       :'The seekers are picking up your signal. Get back inside the circle.';
     mood('zone');
   } else if(p.id===st.imposterId&&st.imposterEligible&&st.mission){
-    var m=st.mission;
+    var m=st.mission, tgt=missionTarget(st);
+    var rad=m.type==='FOLLOW'?CFG.missionFollowRadius:CFG.objectiveRadius;
+    var left=Math.max(0,Math.ceil(m.need-m.progress));
     ttl='Secret mission';
-    txt=m.type==='FOLLOW'
-      ? 'Get close to '+((st.players[m.targetId]||{}).name||'them')+' and stay within 25 m for 30 s.\nReward: their area is secretly leaked to the seekers.'
-      : 'Reach the purple spot and hold it for 15 s.\nReward: earn a secret tip.';
     prog=m.progress/m.need;
-    if(m.active) txt=(m.type==='FOLLOW'?((st.players[m.targetId]||{}).name+' is nearby. Stay close…'):'Holding the spot…')+' '+Math.max(0,Math.ceil(m.need-m.progress))+'s';
+    if(!tgt){
+      txt=m.type==='FOLLOW'?'Waiting for a signal from your target…':'Heading to the secret spot…';
+    } else if(m.active){
+      // one line, one number: how much longer to hold still
+      txt=(m.type==='FOLLOW'?'You are close enough to '+tgt.name+'. Stay with them — '
+                            :'You are on the spot. Hold it — ')+left+'s to go.';
+    } else {
+      var away=G.pos?Math.round(metersBetween(G.pos,tgt)):null;
+      txt=(m.type==='FOLLOW'
+            ? tgt.name+' is '+(away==null?'somewhere on your map':away+' m away')+
+              '. Follow the purple arrow and get within '+rad+' m.'
+            : 'The purple spot is '+(away==null?'on your map':away+' m away')+
+              '. Follow the arrow and stand there.')+
+          '\nThen hold it for '+m.need+'s. '+
+          (m.type==='FOLLOW'?'Their area is quietly sent to the seekers — nobody knows it was you.'
+                            :'You earn a secret tip to send whenever you like.');
+    }
   } else if(p.role==='seeker'){
     ttl='Hunt'; txt='Watch for signals on your map. Get within 10 m of a hider to catch them.';
   }
@@ -2551,13 +2608,17 @@ function updateHUD(){
     if(p.role==='seeker') mood('seeker');
     else if(p.id===st.imposterId&&st.imposterEligible&&st.mission&&st.mission.active) mood('imposter');
     else {
-      var here=G.pos?{id:p.id,lat:G.pos.lat,lng:G.pos.lng}:p;
-      var near=nearestSeeker(st.players,here);
-      var danger=CFG.nearWarn>0&&near<=CFG.nearWarn;
-      mood(danger?'danger':'calm');
-      // a buzz you can feel through a pocket, not so often it stops meaning anything
-      if(danger&&now()-(G._nearBuzz||0)>5000){ G._nearBuzz=now(); buzz([40,70,40]); }
-      if(!danger) G._nearBuzz=0;
+      // The screen never changes colour because a seeker is close. It used to, at a fixed
+      // 70 m, which quietly handed every hider a proximity detector they never asked for
+      // and could not turn off. The only proximity signal now is the buzz below, and the
+      // host has to switch that on deliberately.
+      mood('calm');
+      if(CFG.nearWarn>0){
+        var here=G.pos?{id:p.id,lat:G.pos.lat,lng:G.pos.lng}:p;
+        if(nearestSeeker(st.players,here)<=CFG.nearWarn){
+          if(now()-(G._nearBuzz||0)>5000){ G._nearBuzz=now(); buzz([40,70,40]); }
+        } else G._nearBuzz=0;
+      }
     }
   }
 }
@@ -3084,9 +3145,10 @@ var SETUP=[
    fmt:function(v){return v===0?'never':v+'×';},h:'How many times the safe circle shrinks and relocates.'},
   {k:'zoneShrink',t:'Shrink per move',type:'range',min:0.4,max:0.95,step:0.05,
    fmt:function(v){return Math.round(v*100)+'%';},h:'Each new circle is this fraction of the last one.'},
-  {k:'nearWarn',t:'Warn when a seeker is near',type:'seg',opts:[[0,'Off'],[40,'Close'],[70,'Normal']],
-   h:'Buzzes your phone and reddens the screen edge when a seeker gets this close. It does not '+
-     'show you where they are — only that you should move. Off makes hiding much tenser.'},
+  {k:'nearWarn',t:'Buzz when a seeker is near',type:'seg',opts:[[0,'Off'],[40,'Close'],[70,'Normal']],
+   h:'Off by default. Turn it on and a hider’s phone buzzes when a seeker gets this close — '+
+     'nothing on screen, no direction, just a nudge to move. Off is the fair version: you have '+
+     'no idea anyone is coming.'},
   {k:'hiderSight',t:'Hiders see each other',type:'seg',opts:[[1,'On'],[0,'Off']],
    h:'On: hiders see other hiders on the map by name, so you can regroup and it is obvious '+
      'who is left. Off: every hider is on their own — but the imposter can still see everyone, '+
@@ -3444,7 +3506,7 @@ function boot(){
   $('#b-reset-rules').onclick=function(){
     G.cfg={matchLen:2700,areaR:450,imposters:1,scatter:180,catchRadius:10,conversion:60,
       fullSignal:60,zoneStages:5,zoneShrink:0.66,tribunals:2,trackScale:1,trackRate:1,
-      hiderSight:1,objectives:1,gpsForgive:1,mapStyle:'real'};
+      hiderSight:1,nearWarn:0,objectives:1,gpsForgive:1,mapStyle:'real'};
     buildSetup(); pvFocus('areaR'); SFX.ok();
   };
   $('#b-create').onclick=function(){ SFX.tap(); buildSetup();

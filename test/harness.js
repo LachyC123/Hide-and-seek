@@ -999,6 +999,39 @@ t('hiders seeing each other never leaks who the imposter is',()=>{
   const asImp=withSight(1,()=>C.sees(vHider,{id:'i1',role:'imposter'},room(),0));
   return eq(asHider,asImp);});
 
+/* ---- the imposter's missions ---- */
+const missionRoom=(m,players)=>({mission:m,players:players||{},imposterId:'i1',imposterEligible:true});
+t('a lure mission points at the spot itself',()=>{
+  const t2=C.missionTarget(missionRoom({type:'LURE',lat:O.lat,lng:O.lng}));
+  return ok(t2&&t2.spot===true&&t2.lat===O.lat);});
+t('a follow mission points at wherever the target currently is',()=>{
+  const t2=C.missionTarget(missionRoom({type:'FOLLOW',targetId:'a'},
+    {a:{name:'MAYA',lat:O.lat,lng:O.lng}}));
+  return ok(t2&&t2.spot===false&&t2.name==='MAYA');});
+t('a follow target who has not reported in yet gives nothing to point at',()=>
+  eq(C.missionTarget(missionRoom({type:'FOLLOW',targetId:'a'},{a:{name:'MAYA',lat:null}})),null));
+t('a follow target who gets caught stops being a target',()=>
+  eq(C.missionTarget(missionRoom({type:'FOLLOW',targetId:'a'},
+    {a:{name:'MAYA',lat:O.lat,lng:O.lng,caught:true}})),null));
+t('with no mission there is nothing to point at',()=>
+  ok(C.missionTarget({players:{}})===null&&C.missionTarget(null)===null));
+t('holding position builds mission progress',()=>{
+  const m={type:'LURE',lat:O.lat,lng:O.lng,need:12,progress:0};
+  const imp={lat:O.lat,lng:O.lng};
+  const r=C.missionTick(m,imp,{},5);
+  return ok(r.active&&m.progress===5);});
+t('stepping away for a moment does not wipe the progress',()=>{
+  const m={type:'LURE',lat:O.lat,lng:O.lng,need:12,progress:10};
+  const away=C.offsetLatLng(O,200,0);
+  C.missionTick(m,{lat:away.lat,lng:away.lng},{},2);
+  return ok(m.progress>=9,'dropped to '+m.progress+' after two seconds away');});
+t('a mission still completes rather than stalling forever',()=>{
+  const m={type:'LURE',lat:O.lat,lng:O.lng,need:12,progress:11};
+  const r=C.missionTick(m,{lat:O.lat,lng:O.lng},{},2);
+  return ok(r.done&&m.progress===12);});
+t('the follow radius is forgiving enough to walk with someone',()=>
+  ok(C.CFG.missionFollowRadius>=30&&C.CFG.missionFollowTime<=25));
+
 /* ---- knowing a seeker is close ---- */
 const at=(dx)=>{const p=C.offsetLatLng(O,dx,0);return {lat:p.lat,lng:p.lng};};
 t('the nearest seeker is the one that counts, not the first one found',()=>{
@@ -1023,7 +1056,7 @@ t('with no fix of your own there is nothing to measure',()=>
 t('the warning distance is a host setting and is clamped',()=>
   ok(C.sanitiseCfg({nearWarn:0}).nearWarn===0&&
      C.sanitiseCfg({nearWarn:999}).nearWarn===150&&
-     C.sanitiseCfg({}).nearWarn===70));
+     C.sanitiseCfg({}).nearWarn===0),'proximity warnings must be off unless asked for');
 
 /* ---- how often seekers get a signal ---- */
 t('the normal rate is the rate the match was always tuned to',()=>

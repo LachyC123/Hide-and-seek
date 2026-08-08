@@ -125,7 +125,7 @@ can join.
 ```bash
 npm install
 npm run serve     # http://localhost:8080 — GPS works on localhost
-npm test          # 292 logic tests + 7 browser-simulated runs
+npm test          # 301 logic tests + 7 browser-simulated runs
 ```
 
 `test/smoke7.js` is worth knowing about: it boots the real built file in two windows against a

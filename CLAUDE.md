@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  292 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  301 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -77,6 +77,13 @@ Break any of these and the game stops making sense:
 - How often a hider gives themselves away is `signalGap`, host-tunable down to never. Being
   outside the zone still exposes you with signals off — that is the punishment for it, not a
   tracking feature.
+- **Nothing on screen may change because a seeker is near.** The mood colour used to shift at a
+  fixed 70 m, which handed every hider a proximity detector they never asked for and could not
+  switch off. The only proximity signal is a buzz, `CFG.nearWarn`, off unless the host turns it on.
+- The imposter's mission is the one thing they must physically walk to, so `missionTarget` gives
+  the card and the map a single answer and both show live distance. Progress ebbs at
+  `CFG.missionDecay`, slowly, so losing contact for a few seconds is survivable — a mission that
+  resets on a moment's inattention will not be attempted twice.
 - Blips are approximate and tighten over the match; they never pin a hider exactly.
 - The join link omits the connection when the page already carries it in `MP_DEFAULT`. That is
   what keeps it short enough for a scannable QR code; a link that has to carry a connection is
@@ -184,7 +191,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           292 core tests + 7 smoke runs
+npm test           301 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 
