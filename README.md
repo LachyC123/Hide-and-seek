@@ -23,42 +23,39 @@ Supabase project for this — plain REST calls, no SDK, still one static file.
 to set anything up.
 
 1. Create a free project at [supabase.com](https://supabase.com).
-2. SQL editor → paste and run:
-
-   ```sql
-   create table if not exists fs_rooms (
-     code text primary key,
-     state jsonb not null,
-     updated_at timestamptz not null default now());
-
-   create table if not exists fs_inputs (
-     code text not null,
-     player_id text not null,
-     input jsonb not null,
-     updated_at timestamptz not null default now(),
-     primary key (code, player_id));
-
-   alter table fs_rooms  enable row level security;
-   alter table fs_inputs enable row level security;
-
-   create policy fs_rooms_all  on fs_rooms  for all to anon using (true) with check (true);
-   create policy fs_inputs_all on fs_inputs for all to anon using (true) with check (true);
-   ```
-
+2. SQL editor → paste and run the block shown on the game's **Multiplayer setup** screen. It
+   creates two tables, makes them unreachable from a browser, and exposes a handful of stored
+   functions that each require a room code. Safe to re-run.
 3. Project settings → API. Copy the **project URL** and the **anon public** key.
+   Never the `service_role` key — that one bypasses everything.
 4. In the game: home screen → **Multiplayer setup** → paste both → *Save & test connection*.
+   That does a real write-and-read round trip and tells you exactly what is wrong if anything is.
 5. Create a game. The lobby shows a **join link** — send that to everyone. Opening it connects
    their phone and drops them straight into your lobby.
 
-The anon key is designed to be public, so it is safe in a link. What it is *not* is a secret
-that hides anything: anyone holding the link can read the room, which includes who the imposter
-is. That is the same trust model the game had before — roles are hidden by the app, not by the
-database. Don't hand the link to someone who isn't playing.
+To skip step 4 for everybody forever, put the same two values in `MP_DEFAULT` at the top of
+`src/game.js` and rebuild. Then the deployed link is already connected and players only ever
+type a room code.
+
+### What the anon key does and does not protect
+
+The anon key is designed to ship inside client apps, and it is in the served page whether or not
+it is in the repo — anyone playing can read it out of devtools. It is not a secret.
+
+The security therefore comes from the schema, not the key. The browser cannot touch `fs_rooms`
+or `fs_inputs` directly; it can only call functions that take a room code. So holding the key
+gets you nothing without a code, and you cannot list rooms to go looking for one. A room's state
+does contain who the imposter is, so treat the 5-character code the way you would treat the
+answer: don't paste a live one anywhere public.
 
 Two practical notes. A long match with eight players moves a few hundred MB of state, so a busy
-month can eat a free project's egress; and the old rows are never cleaned up, so run
-`delete from fs_rooms where updated_at < now() - interval '1 day';` (and the same for
-`fs_inputs`) now and then.
+month can eat a free project's egress. And finished rooms are never tidied up, so occasionally
+run this in the SQL editor:
+
+```sql
+delete from fs_inputs where updated_at < now() - interval '1 day';
+delete from fs_rooms  where updated_at < now() - interval '1 day';
+```
 
 Without any of this the game still runs — **Solo test run** works offline, and *Create game*
 will tell you plainly that it has nowhere to put a room rather than handing you a code nobody
@@ -69,7 +66,7 @@ can join.
 ```bash
 npm install
 npm run serve     # http://localhost:8080 — GPS works on localhost
-npm test          # 190 logic tests + 7 browser-simulated runs
+npm test          # 200 logic tests + 7 browser-simulated runs
 ```
 
 `test/smoke7.js` is worth knowing about: it boots the real built file in two windows against a

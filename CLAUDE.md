@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  190 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  200 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -98,11 +98,17 @@ writes one input row (position + unacknowledged actions) and reads the state bac
 adapters behind one four-call interface (`netPutState` / `netGetState` / `netPutInput` /
 `netListInputs`):
 
-- **`supabase`** — plain REST via `fetch`, no SDK. Two tables, `fs_rooms` and `fs_inputs`; the
-  SQL lives in `MP_SQL` and is shown on the setup screen. Configured from the join link hash
-  (`#room=CODE&mp=<url>~<anonkey>`) or the setup screen, persisted in the profile. This is the
-  only adapter that works phone to phone from a static host.
+- **`supabase`** — plain REST via `fetch`, no SDK. The browser never touches a table: RLS is on
+  with no policies and the grants are revoked, so everything goes through `security definer`
+  functions that each take the room code. `rpcFor` is the single map from operation to function,
+  `MP_SQL` is the schema that must define and grant every one of them, and a harness test fails
+  if those two ever disagree. Config comes from the join link hash
+  (`#room=CODE&mp=<url>~<anonkey>`), then the saved profile, then `MP_DEFAULT` baked into the
+  build. This is the only adapter that works phone to phone from a static host.
 - **`storage`** — the old `window.storage` bridge. Only works inside a host page that injects it.
+
+Never send `Prefer: return=minimal` on an RPC call — PostgREST answers 204 with no body and
+every read silently comes back empty. `supaRequest` omits the header unless asked.
 
 Things that are load-bearing and easy to break:
 
@@ -112,15 +118,17 @@ Things that are load-bearing and easy to break:
 - `wireState` strips host-only bookkeeping and trims the event log before every push. A room is
   ~1 KB per player per push; at the current intervals a long match with eight players moves a
   few hundred MB, which matters on a free Supabase project.
-- Anyone can read the room row, so roles are still only hidden by client-side convention. The
-  next step is RLS plus a server-side `hostSim` in an Edge Function; the CORE block ports across
-  almost unchanged, which is why it is kept pure.
+- The room code is the only thing gating access to a match. Within a room, roles are still hidden
+  by client-side convention alone — a player who reads the state can see the imposter. Fixing
+  that properly means a server-side `hostSim` in an Edge Function handing each client only what
+  its role may see; the CORE block ports across almost unchanged, which is why it is kept pure.
 
 Known limits, in the order they'll hurt:
 
 1. **The host must stay open.** There is no host migration — if the host's phone dies, the match
    dies with it. Clients detect it (`hostAlive`) and say so, but cannot take over.
-2. **Roles are readable by anyone who opens the room row.** See above.
+2. **Anyone holding a room code can read that room, including who the imposter is.** The code is
+   the only secret; rooms cannot be listed or enumerated, but a leaked code is a leaked match.
 3. Street data comes from public Overpass, now with four mirrors and failover. Fine for testing,
    one fetch per area, cached to the device, refetched as players move out of the loaded area.
    Self-host or move to a paid vector source before any real release.
@@ -135,7 +143,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           190 core tests + 7 smoke runs
+npm test           200 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 

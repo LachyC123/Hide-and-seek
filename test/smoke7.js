@@ -21,36 +21,37 @@ function res(status,body){
   return Promise.resolve({ok:status<400,status:status,
     json:()=>Promise.resolve(body),text:()=>Promise.resolve(JSON.stringify(body||''))});
 }
-function eqParam(qs,name){
-  const m=new RegExp('(?:\\?|&)'+name+'=eq\\.([^&]*)').exec(qs);
-  return m?decodeURIComponent(m[1]):null;
-}
+/* Stands in for the stored functions in MP_SQL. Anything the client asks for that is
+   not one of them 404s, exactly like PostgREST would if the SQL had not been run —
+   and there is deliberately no way to read a room without naming its code. */
+const clone=v=>JSON.parse(JSON.stringify(v));
+const FUNCTIONS={
+  fs_put_room:a=>{ DB.rooms.set(a.p_code.toUpperCase(),clone(a.p_state)); return null; },
+  fs_get_room:a=>DB.rooms.get(a.p_code.toUpperCase())||null,
+  fs_drop_room:a=>{ const c=a.p_code.toUpperCase(); DB.rooms.delete(c);
+    [...DB.inputs.keys()].forEach(k=>{ if(k.split('|')[0]===c) DB.inputs.delete(k); }); return null; },
+  fs_put_input:a=>{ DB.inputs.set(a.p_code.toUpperCase()+'|'+a.p_player,clone(a.p_input)); return null; },
+  fs_list_inputs:a=>{ const c=a.p_code.toUpperCase(), out=[];
+    DB.inputs.forEach((v,k)=>{ if(k.split('|')[0]===c) out.push(clone(v)); }); return out; },
+  fs_clear_inputs:a=>{ const c=a.p_code.toUpperCase();
+    [...DB.inputs.keys()].forEach(k=>{ if(k.split('|')[0]===c) DB.inputs.delete(k); }); return null; },
+  fs_drop_input:a=>{ DB.inputs.delete(a.p_code.toUpperCase()+'|'+a.p_player); return null; }
+};
+let tableHits=0;
 function backend(url,opts){
   calls++;
   opts=opts||{};
   const h=opts.headers||{};
   if(h.apikey!==KEY||h.Authorization!=='Bearer '+KEY){ badAuth++; return res(401,{message:'bad key'}); }
   const rest=url.slice((PROJECT+'/rest/v1/').length);
-  const table=rest.split('?')[0], qs=rest.slice(table.length);
-  const store=table==='fs_rooms'?DB.rooms:table==='fs_inputs'?DB.inputs:null;
-  if(!store) return res(404,{message:'no such table '+table});
-  if((opts.method||'GET')==='DELETE'){
-    const code=eqParam(qs,'code');
-    [...store.keys()].forEach(k=>{ if(store.get(k).code===code) store.delete(k); });
-    return res(204,null);
-  }
-  if((opts.method||'GET')==='POST'){
-    const rows=JSON.parse(opts.body);
-    rows.forEach(r=>{
-      const key=table==='fs_rooms'?r.code:r.code+'|'+r.player_id;
-      store.set(key,JSON.parse(JSON.stringify(r)));
-    });
-    return res(201,null);
-  }
-  const code=eqParam(qs,'code');
-  const out=[];
-  store.forEach(r=>{ if(!code||r.code===code) out.push(JSON.parse(JSON.stringify(r))); });
-  return res(200,out);
+  if(rest.indexOf('rpc/')!==0){ tableHits++; return res(401,{message:'permission denied for table'}); }
+  const fn=rest.slice(4).split('?')[0], impl=FUNCTIONS[fn];
+  if(!impl) return res(404,{code:'PGRST202',message:'could not find function '+fn});
+  if((opts.method||'GET')!=='POST') return res(405,{message:'rpc needs POST'});
+  // Prefer: return=minimal on an RPC would blank the body — the client must not send it
+  if(h.Prefer&&/return=minimal/.test(h.Prefer)) return res(204,null);
+  const out=impl(JSON.parse(opts.body||'{}'));
+  return out===null?res(204,null):res(200,out);
 }
 
 /* ---- a device's local storage, which survives a reload of its browser ---- */
@@ -136,7 +137,7 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
     log.push('host created room '+code+' via Supabase');
 
     await waitFor('the room to be published to the backend',()=>DB.rooms.has(code),8000);
-    log.push('room row exists in the backend, state.phase='+DB.rooms.get(code).state.phase);
+    log.push('room row exists in the backend, state.phase='+DB.rooms.get(code).phase);
 
     const link=HOST.text('#lobbyLink');
     if(link.indexOf('#room='+code)<0||link.indexOf('mp=')<0)
@@ -242,10 +243,11 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
       (/uncaught (\d+)/.exec(HOST.text('#devlog'))||[])[1]);
 
     if(badAuth) throw new Error(badAuth+' requests went out without valid credentials');
-    log.push('backend calls: '+calls+', all authenticated');
+    if(tableHits) throw new Error(tableHits+' requests bypassed the stored functions and hit a table directly');
+    log.push('backend calls: '+calls+', all authenticated, all via stored functions');
 
     // bandwidth is the thing that decides whether a free project survives a match
-    const wire=DB.rooms.get(code).state;
+    const wire=DB.rooms.get(code);
     const bytes=JSON.stringify(wire).length;
     if(wire._last!==undefined) throw new Error('host-only bookkeeping is going over the wire');
     if((wire.events||[]).length>20) throw new Error('event log is not being trimmed for the wire');

@@ -351,14 +351,113 @@ function hostAlive(st,nowMs){ return !!st&&(nowMs-(st.hostAt||0))<CFG.hostTimeou
 /* --- Supabase transport (plain REST, no SDK) --------------------------- */
 function supaRequest(mp,path,opts){
   opts=opts||{};
+  var h={apikey:mp.key,Authorization:'Bearer '+mp.key,'Content-Type':'application/json'};
+  // Prefer is only sent when asked for. On an RPC call `return=minimal` makes
+  // PostgREST answer 204 with no body, which silently empties every read.
+  if(opts.prefer) h.Prefer=opts.prefer;
   return {
     url:mp.url.replace(/\/+$/,'')+'/rest/v1/'+path,
     method:opts.method||'GET',
-    headers:{apikey:mp.key,Authorization:'Bearer '+mp.key,
-      'Content-Type':'application/json',
-      Prefer:opts.prefer||'return=minimal'},
+    headers:h,
     body:opts.body===undefined?undefined:JSON.stringify(opts.body)
   };
+}
+/* Every room operation is a stored function that takes the room code, and the
+   tables themselves are unreachable from the browser. Knowing a code is the only
+   way in: no listing rooms, no reading a match you were not invited to. */
+function rpcFor(op,code,id,payload){
+  if(op==='putState')    return {fn:'fs_put_room',   args:{p_code:code,p_state:payload}};
+  if(op==='getState')    return {fn:'fs_get_room',   args:{p_code:code}};
+  if(op==='dropRoom')    return {fn:'fs_drop_room',  args:{p_code:code}};
+  if(op==='putInput')    return {fn:'fs_put_input',  args:{p_code:code,p_player:id,p_input:payload}};
+  if(op==='listInputs')  return {fn:'fs_list_inputs',args:{p_code:code}};
+  if(op==='clearInputs') return {fn:'fs_clear_inputs',args:{p_code:code}};
+  if(op==='dropInput')   return {fn:'fs_drop_input', args:{p_code:code,p_player:id}};
+  return null;
+}
+var MP_SQL=[
+  '-- FALSE SAFE room storage. Run once in the Supabase SQL editor.',
+  '-- Safe to re-run, and safe to run over the older table-policy version.',
+  '',
+  'create table if not exists fs_rooms (',
+  '  code text primary key,',
+  '  state jsonb not null,',
+  '  updated_at timestamptz not null default now());',
+  '',
+  'create table if not exists fs_inputs (',
+  '  code text not null,',
+  '  player_id text not null,',
+  '  input jsonb not null,',
+  '  updated_at timestamptz not null default now(),',
+  '  primary key (code, player_id));',
+  '',
+  'create index if not exists fs_rooms_updated  on fs_rooms(updated_at);',
+  'create index if not exists fs_inputs_updated on fs_inputs(updated_at);',
+  '',
+  '-- The tables are not reachable from a browser at all. Everything goes through the',
+  '-- functions below, and every one of them demands the room code. Nobody can list',
+  '-- rooms or read a match they were not invited to.',
+  'drop policy if exists fs_rooms_all  on fs_rooms;',
+  'drop policy if exists fs_inputs_all on fs_inputs;',
+  'alter table fs_rooms  enable row level security;',
+  'alter table fs_inputs enable row level security;',
+  'revoke all on fs_rooms  from anon, authenticated;',
+  'revoke all on fs_inputs from anon, authenticated;',
+  '',
+  'create or replace function fs_put_room(p_code text, p_state jsonb) returns void',
+  'language sql security definer set search_path = public as $$',
+  '  insert into fs_rooms(code, state, updated_at) values (upper(p_code), p_state, now())',
+  '  on conflict (code) do update set state = excluded.state, updated_at = now();',
+  '$$;',
+  '',
+  'create or replace function fs_get_room(p_code text) returns jsonb',
+  'language sql security definer set search_path = public as $$',
+  '  select state from fs_rooms where code = upper(p_code);',
+  '$$;',
+  '',
+  'create or replace function fs_drop_room(p_code text) returns void',
+  'language sql security definer set search_path = public as $$',
+  '  delete from fs_inputs where code = upper(p_code);',
+  '  delete from fs_rooms  where code = upper(p_code);',
+  '$$;',
+  '',
+  'create or replace function fs_put_input(p_code text, p_player text, p_input jsonb) returns void',
+  'language sql security definer set search_path = public as $$',
+  '  insert into fs_inputs(code, player_id, input, updated_at)',
+  '  values (upper(p_code), p_player, p_input, now())',
+  '  on conflict (code, player_id) do update set input = excluded.input, updated_at = now();',
+  '$$;',
+  '',
+  'create or replace function fs_list_inputs(p_code text) returns jsonb',
+  'language sql security definer set search_path = public as $$',
+  "  select coalesce(jsonb_agg(input), '[]'::jsonb) from fs_inputs where code = upper(p_code);",
+  '$$;',
+  '',
+  'create or replace function fs_clear_inputs(p_code text) returns void',
+  'language sql security definer set search_path = public as $$',
+  '  delete from fs_inputs where code = upper(p_code);',
+  '$$;',
+  '',
+  'create or replace function fs_drop_input(p_code text, p_player text) returns void',
+  'language sql security definer set search_path = public as $$',
+  '  delete from fs_inputs where code = upper(p_code) and player_id = p_player;',
+  '$$;',
+  '',
+  'grant execute on function',
+  '  fs_put_room(text, jsonb), fs_get_room(text), fs_drop_room(text),',
+  '  fs_put_input(text, text, jsonb), fs_list_inputs(text),',
+  '  fs_clear_inputs(text), fs_drop_input(text, text)',
+  'to anon;'
+].join('\n');
+
+/* PostgREST reports a missing function as PGRST202. That is not a network problem,
+   it means the SQL was never run — say so instead of "HTTP 404". */
+function supaErrorText(status,body){
+  if(status===404||/PGRST202/.test(body||''))
+    return 'This project has not had the FALSE SAFE SQL run on it yet (or it is on the older table-based version). Open Multiplayer setup and run the SQL block once.';
+  if(status===401||status===403)
+    return 'The project rejected the key. Check you pasted the anon public key, not the service_role one.';
+  return 'HTTP '+status+(body?' — '+body.slice(0,140):'');
 }
 function validMp(mp){
   return !!(mp&&typeof mp.url==='string'&&/^https:\/\/[^\s\/]+\.[^\s\/]+$/.test(mp.url.replace(/\/+$/,''))&&
@@ -618,7 +717,8 @@ var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetL
   reachableSpot:reachableSpot,
   newActions:newActions,mergePlayerInput:mergePlayerInput,pendingActions:pendingActions,
   presence:presence,presentVoters:presentVoters,lostHiders:lostHiders,hostAlive:hostAlive,
-  supaRequest:supaRequest,validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
+  supaRequest:supaRequest,rpcFor:rpcFor,supaErrorText:supaErrorText,MP_SQL:MP_SQL,
+  validMp:validMp,encodeMpConfig:encodeMpConfig,decodeMpConfig:decodeMpConfig,
   parseHash:parseHash,buildJoinLink:buildJoinLink,
   walkMins:walkMins,runDistance:runDistance,carLengths:carLengths,paceText:paceText,
   zonePlan:zonePlan,previewMpp:previewMpp,scaleBarFor:scaleBarFor,
@@ -760,7 +860,24 @@ function sget(k){ if(!hasStore()) return Promise.reject('nostore');
 function slist(prefix){ if(!hasStore()) return Promise.resolve([]);
   return window.storage.list(prefix,true).then(function(r){return (r&&r.keys)||[];}).catch(function(){return [];}); }
 
+/* ---- built-in room connection ----
+   Fill these in to make the deployed page work for everyone with no setup screen
+   and no join link. Both values are public by design: the anon key is meant to ship
+   inside client apps. What it is NOT is a secret that hides anything — with the
+   policies in MP_SQL, anyone holding these can read any room, and a room contains
+   who the imposter is. Leave blank to require the setup screen or a join link.
+   NEVER put the service_role key here. It bypasses every policy. */
+var MP_DEFAULT={url:'',key:''};
+
 var NET={kind:'none',mp:null,lastErr:null,ok:0,fails:0,lastOkAt:0};
+function mpFallback(saved){
+  if(validMp(saved)) return saved;
+  if(validMp(MP_DEFAULT)) return {url:MP_DEFAULT.url.replace(/\/+$/,''),key:MP_DEFAULT.key};
+  return null;
+}
+function usingBuiltInMp(){
+  return !!(validMp(MP_DEFAULT)&&G.mp&&G.mp.key===MP_DEFAULT.key);
+}
 function netKind(){
   if(validMp(G.mp)) return 'supabase';
   if(hasStore()) return 'storage';
@@ -783,12 +900,16 @@ function supaCall(path,opts){
   return fetch(r.url,{method:r.method,headers:r.headers,body:r.body,cache:'no-store'})
     .then(function(res){
       if(!res.ok) return res.text().then(function(t){
-        throw new Error('HTTP '+res.status+(t?' — '+t.slice(0,140):''));
+        throw new Error(supaErrorText(res.status,t));
       });
-      return r.method==='GET'?res.json():null;
+      if(res.status===204) return null;                    // a void function
+      return res.text().then(function(t){ return t?JSON.parse(t):null; });
     });
 }
-var UPSERT='resolution=merge-duplicates,return=minimal';
+function supaRpc(op,code,id,payload){
+  var c=rpcFor(op,code,id,payload);
+  return supaCall('rpc/'+c.fn,{method:'POST',body:c.args});
+}
 
 /* The whole room state goes over the wire several times a minute for every player,
    so anything the other phones cannot use is pure bandwidth. Host-only bookkeeping
@@ -805,49 +926,40 @@ function wireState(st){
 }
 function netPutState(code,st){
   var body=wireState(st);
-  if(NET.kind==='supabase')
-    return supaCall('fs_rooms?on_conflict=code',
-      {method:'POST',prefer:UPSERT,body:[{code:code,state:body}]}).then(netGood,netNote);
+  if(NET.kind==='supabase') return supaRpc('putState',code,null,body).then(netGood,netNote);
   if(NET.kind==='storage') return sput(K(code,':s'),body).then(netGood,netNote);
   return Promise.reject(new Error('no transport'));
 }
-function netDeleteInput(code,id){
-  if(NET.kind==='supabase')
-    return supaCall('fs_inputs?code=eq.'+encodeURIComponent(code)+
-      '&player_id=eq.'+encodeURIComponent(id),{method:'DELETE'}).catch(function(){return null;});
-  if(NET.kind==='storage'&&window.storage&&window.storage.delete)
-    return Promise.resolve(window.storage.delete(K(code,':p:'+id),true)).catch(function(){return null;});
-  return Promise.resolve(null);
-}
 function netGetState(code){
-  if(NET.kind==='supabase')
-    return supaCall('fs_rooms?code=eq.'+encodeURIComponent(code)+'&select=state')
-      .then(function(rows){ return (rows&&rows[0])?rows[0].state:null; }).then(netGood,netNote);
+  if(NET.kind==='supabase') return supaRpc('getState',code).then(netGood,netNote);
   if(NET.kind==='storage') return sget(K(code,':s')).then(netGood,netNote);
   return Promise.reject(new Error('no transport'));
 }
 function netPutInput(code,id,input){
-  if(NET.kind==='supabase')
-    return supaCall('fs_inputs?on_conflict=code,player_id',
-      {method:'POST',prefer:UPSERT,body:[{code:code,player_id:id,input:input}]}).then(netGood,netNote);
+  if(NET.kind==='supabase') return supaRpc('putInput',code,id,input).then(netGood,netNote);
   if(NET.kind==='storage') return sput(K(code,':p:'+id),input).then(netGood,netNote);
   return Promise.reject(new Error('no transport'));
 }
 function netListInputs(code){
   if(NET.kind==='supabase')
-    return supaCall('fs_inputs?code=eq.'+encodeURIComponent(code)+'&select=input')
-      .then(function(rows){ return (rows||[]).map(function(r){return r.input;}); }).then(netGood,netNote);
+    return supaRpc('listInputs',code).then(function(rows){return rows||[];}).then(netGood,netNote);
   if(NET.kind==='storage')
     return slist(K(code,':p:')).then(function(keys){
       return Promise.all(keys.map(function(k){return sget(k).catch(function(){return null;});}));
     }).then(netGood,netNote);
   return Promise.reject(new Error('no transport'));
 }
+function netDeleteInput(code,id){
+  if(NET.kind==='supabase') return supaRpc('dropInput',code,id).catch(function(){return null;});
+  if(NET.kind==='storage'&&window.storage&&window.storage.delete)
+    return Promise.resolve(window.storage.delete(K(code,':p:'+id),true)).catch(function(){return null;});
+  return Promise.resolve(null);
+}
 /* A fresh room must not inherit input rows from whatever used this code before. */
 function netClearInputs(code){
   if(NET.kind==='supabase')
-    return supaCall('fs_inputs?code=eq.'+encodeURIComponent(code),{method:'DELETE'})
-      .then(netGood,function(e){ NET.lastErr=(e&&e.message)||'delete failed'; return null; });
+    return supaRpc('clearInputs',code)
+      .then(netGood,function(e){ NET.lastErr=(e&&e.message)||'cleanup failed'; return null; });
   return Promise.resolve(null);
 }
 /* One cheap round trip that proves the credentials and the tables are real,
@@ -859,33 +971,12 @@ function netTest(){
   return netPutState(probe,{code:probe,probe:true})
     .then(function(){ return netGetState(probe); })
     .then(function(s){
-      if(!s||!s.probe) throw new Error('Wrote the room but could not read it back — check the table policies.');
-      return true;
-    });
+      if(!s||!s.probe) throw new Error('Wrote a room but could not read it back — re-run the SQL block below.');
+      return supaRpc('dropRoom',probe).catch(function(){return null;});   // don't leave litter
+    }).then(function(){ return true; });
 }
 
-var MP_SQL=[
-  '-- Run this once in the Supabase SQL editor.',
-  'create table if not exists fs_rooms (',
-  '  code text primary key,',
-  '  state jsonb not null,',
-  '  updated_at timestamptz not null default now());',
-  '',
-  'create table if not exists fs_inputs (',
-  '  code text not null,',
-  '  player_id text not null,',
-  '  input jsonb not null,',
-  '  updated_at timestamptz not null default now(),',
-  '  primary key (code, player_id));',
-  '',
-  'alter table fs_rooms  enable row level security;',
-  'alter table fs_inputs enable row level security;',
-  '',
-  '-- Anyone with the anon key can play. Same trust model as a room code:',
-  '-- knowing the code is knowing the room.',
-  'create policy fs_rooms_all  on fs_rooms  for all to anon using (true) with check (true);',
-  'create policy fs_inputs_all on fs_inputs for all to anon using (true) with check (true);'
-].join('\n');
+
 
 function newCode(){
   var A='ACDEFGHJKLMNPQRSTUVWXYZ23456789',s='';
@@ -1687,7 +1778,9 @@ function renderMpScreen(){
   var s=$('#mpStatus'); if(!s) return;
   netRefresh();
   s.textContent=NET.kind==='supabase'
-    ? 'Connected through '+G.mp.url+'. Rooms you create can be joined from any phone.'
+    ? (usingBuiltInMp()
+        ? 'Connected through '+G.mp.url+' — built into this copy of the game, so every phone that opens the link is already set up. Nothing to do here.'
+        : 'Connected through '+G.mp.url+'. Rooms you create can be joined from any phone.')
     : NET.kind==='storage'
       ? 'Using the host page’s storage bridge. That only works for people opening this exact page inside the same host — add a Supabase project for real phone-to-phone play.'
       : 'No connection. Create game will only offer solo play until this is filled in.';
@@ -2702,7 +2795,8 @@ function boot(){
   loadProfile().then(function(p){
     if(p&&p.name){ G.me.name=p.name; G.me.char=p.char||0; $('#nameInput').value=p.name; }
     if(p&&p.id) G.me.id=p.id;
-    if(!H.mp&&p&&validMp(p.mp)) G.mp=p.mp;
+    // join link beats what this device saved, which beats what shipped in the build
+    if(!H.mp) G.mp=mpFallback(p&&p.mp);
     netRefresh();
     buildCharGrid(); paintChar($('#charBig'),G.me.char,'S',0);
     if(H.code){
@@ -2758,7 +2852,7 @@ function boot(){
   $('#b-profile').onclick=function(){ SFX.tap(); buildCharGrid(); show('s-char'); };
   $('#b-mp').onclick=function(){ SFX.tap(); renderMpScreen(); show('s-mp'); };
   $('#b-mp-save').onclick=function(){ SFX.tap(); saveMp(); };
-  $('#b-mp-clear').onclick=function(){ G.mp=null; $('#mpUrl').value=''; $('#mpKey').value='';
+  $('#b-mp-clear').onclick=function(){ G.mp=mpFallback(null); $('#mpUrl').value=''; $('#mpKey').value='';
     $('#mpMsg').textContent=''; netRefresh(); saveProfile(); SFX.tap(); renderMpScreen(); };
   $('#b-copy-link').onclick=function(){
     var t=G.joinLink||''; SFX.tap();

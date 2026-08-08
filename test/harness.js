@@ -667,23 +667,61 @@ t('a host that stopped writing is noticed',()=>
 
 /* ---- Supabase transport shaping ---- */
 const MP={url:'https://abc.supabase.co',key:'x'.repeat(40)};
-t('a room read goes to the rooms table with the key attached',()=>{
-  const r=C.supaRequest(MP,'fs_rooms?code=eq.ABCDE&select=state');
-  return ok(r.url==='https://abc.supabase.co/rest/v1/fs_rooms?code=eq.ABCDE&select=state'&&
-            r.headers.apikey===MP.key&&r.headers.Authorization==='Bearer '+MP.key&&r.method==='GET');});
-t('a room write is an upsert with a JSON body',()=>{
-  const r=C.supaRequest(MP,'fs_rooms?on_conflict=code',
-    {method:'POST',prefer:'resolution=merge-duplicates,return=minimal',body:[{code:'A'}]});
-  return ok(r.method==='POST'&&r.headers.Prefer.indexOf('merge-duplicates')>=0&&
-            r.body==='[{"code":"A"}]');});
+t('a call carries the key both ways round',()=>{
+  const r=C.supaRequest(MP,'rpc/fs_get_room',{method:'POST',body:{p_code:'ABCDE'}});
+  return ok(r.url==='https://abc.supabase.co/rest/v1/rpc/fs_get_room'&&
+            r.headers.apikey===MP.key&&r.headers.Authorization==='Bearer '+MP.key&&
+            r.method==='POST'&&r.body==='{"p_code":"ABCDE"}');});
+t('no Prefer header is sent unless one is asked for',()=>
+  eq(C.supaRequest(MP,'rpc/fs_get_room',{method:'POST',body:{}}).headers.Prefer,undefined));
+t('a Prefer header is passed through when it is wanted',()=>
+  ok(C.supaRequest(MP,'x',{prefer:'count=exact'}).headers.Prefer==='count=exact'));
 t('a trailing slash on the project URL does not double up',()=>
-  eq(C.supaRequest({url:'https://abc.supabase.co/',key:MP.key},'fs_rooms').url,
-     'https://abc.supabase.co/rest/v1/fs_rooms'));
+  eq(C.supaRequest({url:'https://abc.supabase.co/',key:MP.key},'rpc/fs_get_room').url,
+     'https://abc.supabase.co/rest/v1/rpc/fs_get_room'));
+t('every room operation names the room it is for',()=>{
+  ['putState','getState','dropRoom','putInput','listInputs','clearInputs','dropInput']
+    .forEach(op=>{
+      const c=C.rpcFor(op,'ABCDE','p1',{x:1});
+      if(!c) throw new Error(op+' has no stored function');
+      if(c.args.p_code!=='ABCDE') throw new Error(op+' does not pass the room code');
+    });
+  return true;});
+t('reading a room is impossible without naming it',()=>{
+  const c=C.rpcFor('getState','ABCDE');
+  return ok(c.fn==='fs_get_room'&&Object.keys(c.args).length===1&&c.args.p_code==='ABCDE');});
+t('a player-scoped call names the player too',()=>{
+  const c=C.rpcFor('putInput','ABCDE','p1',{lat:1});
+  return ok(c.args.p_player==='p1'&&c.args.p_input.lat===1);});
+t('every stored function the client calls exists in the SQL it ships',()=>{
+  // the SQL block is the install instructions; a call with no matching function is a
+  // support ticket that reads "HTTP 404" and nothing else
+  const fns=['putState','getState','dropRoom','putInput','listInputs','clearInputs','dropInput']
+    .map(op=>C.rpcFor(op).fn);
+  const missing=fns.filter(f=>C.MP_SQL.indexOf('function '+f+'(')<0);
+  if(missing.length) throw new Error('not created by MP_SQL: '+missing.join(', '));
+  const ungranted=fns.filter(f=>C.MP_SQL.slice(C.MP_SQL.indexOf('grant execute')).indexOf(f+'(')<0);
+  if(ungranted.length) throw new Error('never granted to anon: '+ungranted.join(', '));
+  return true;});
+t('the SQL leaves the tables unreachable from a browser',()=>
+  ok(C.MP_SQL.indexOf('revoke all on fs_rooms')>=0&&
+     C.MP_SQL.indexOf('revoke all on fs_inputs')>=0&&
+     C.MP_SQL.indexOf('enable row level security')>=0));
+t('the SQL clears the older open policies so it can be re-run',()=>
+  ok(C.MP_SQL.indexOf('drop policy if exists fs_rooms_all')>=0&&
+     C.MP_SQL.indexOf('drop policy if exists fs_inputs_all')>=0));
+t('a missing function is explained as unrun SQL, not as a 404',()=>
+  ok(/SQL/.test(C.supaErrorText(404,''))&&/SQL/.test(C.supaErrorText(400,'{"code":"PGRST202"}'))));
+t('a rejected key points at the service_role mix-up',()=>
+  ok(/anon public/.test(C.supaErrorText(401,''))&&/anon public/.test(C.supaErrorText(403,''))));
 t('a plausible project and key are accepted',()=>ok(C.validMp(MP)));
 t('an http URL or a stub key is refused',()=>
   ok(!C.validMp({url:'http://abc.supabase.co',key:MP.key})&&
      !C.validMp({url:'https://abc.supabase.co',key:'short'})&&
      !C.validMp(null)&&!C.validMp({})));
+
+t('a blank built-in connection is not mistaken for a real one',()=>
+  ok(!C.validMp({url:'',key:''})));
 
 /* ---- join links ---- */
 t('a join link carries the room and the connection',()=>{
