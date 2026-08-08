@@ -195,6 +195,21 @@ function pump(...ps){ ps.forEach(p=>{try{p.dev('force sync now');}catch(e){}}); 
     if(GUEST.text('#lobbyRoster').indexOf('LACHY')<0)
       throw new Error('guest cannot see the host in the roster');
 
+    // the guest puts their hand up, and the host must see it before the match starts
+    GUEST.click('#b-volunteer');
+    await waitFor('the volunteer to reach the host',()=>{
+      pump(HOST,GUEST);
+      return HOST.text('#lobbyRoster').indexOf('WANTS TO SEEK')>=0 ||
+             /volunteered to seek/.test(HOST.text('#lobbyHint'));
+    },12000);
+    log.push('host lobby says: '+HOST.text('#lobbyHint').replace(/^.*?\. /,''));
+    GUEST.click('#b-volunteer');                 // and can take it back again
+    await waitFor('taking it back to reach the host',()=>{
+      pump(HOST,GUEST);
+      return /Nobody has volunteered/.test(HOST.text('#lobbyHint'));
+    },12000);
+    log.push('guest withdrew and the host saw that too');
+
     // a third seat so there is an imposter and a real vote to hold
     HOST.dev('+ bot'); HOST.dev('+ bot');
     await waitFor('bots to propagate',()=>{

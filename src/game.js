@@ -93,14 +93,33 @@ function phaseFor(t,cfg){ // t = seconds since match start (scatter included)
 function huntClock(t){return Math.max(0,t-CFG.scatter);}
 
 /* --- roles ---------------------------------------------------------- */
-function assignRoles(ids,rng,imposters){
+/* `volunteers` is the ids of anyone who put their hand up in the lobby. They go first,
+   but more than one and the shuffle still picks between them — volunteering means you are
+   in the running, not that you are guaranteed it. With nobody volunteering this behaves
+   exactly as it always did. A volunteer who misses out can still draw the imposter. */
+function assignRoles(ids,rng,imposters,volunteers){
   var pool=ids.slice(), out={}, i;
   for(i=pool.length-1;i>0;i--){var j=Math.floor(rng()*(i+1));var tmp=pool[i];pool[i]=pool[j];pool[j]=tmp;}
   for(i=0;i<pool.length;i++) out[pool[i]]='hider';
-  out[pool[0]]='seeker';
+  var seeker=pool[0];
+  if(volunteers&&volunteers.length){
+    for(i=0;i<pool.length;i++){
+      if(volunteers.indexOf(pool[i])>=0){ seeker=pool[i]; break; }
+    }
+  }
+  out[seeker]='seeker';
   var imp=null;
-  if(imposters>0&&pool.length>2){ imp=pool[1]; out[imp]='imposter'; }
-  return {roles:out,imposterId:imp,seekerId:pool[0]};
+  if(imposters>0&&pool.length>2){
+    for(i=0;i<pool.length;i++){ if(pool[i]!==seeker){ imp=pool[i]; break; } }
+    if(imp) out[imp]='imposter';
+  }
+  return {roles:out,imposterId:imp,seekerId:seeker};
+}
+function volunteerIds(players){
+  return Object.keys(players||{}).filter(function(id){
+    var p=players[id];
+    return !!(p&&p.wantsSeek&&!p.bot);
+  });
 }
 
 /* --- zone ------------------------------------------------------------ */
@@ -1029,7 +1048,7 @@ function ROAD_STYLE(k){
 }
 
 var CORE={mulberry32:mulberry32,metersBetween:metersBetween,offsetLatLng:offsetLatLng,CFG:CFG,
-  schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,nextZone:nextZone,
+  schedule:schedule,phaseFor:phaseFor,huntClock:huntClock,assignRoles:assignRoles,volunteerIds:volunteerIds,nextZone:nextZone,
   zoneContains:zoneContains,zoneStageTimes:zoneStageTimes,trackingBand:trackingBand,makeBlip:makeBlip,
   signalGap:signalGap,sees:sees,nearestSeeker:nearestSeeker,
   canCatch:canCatch,eligibleVoters:eligibleVoters,resolveVote:resolveVote,voteConsequence:voteConsequence,
@@ -1345,7 +1364,7 @@ function newMatch(code,hostId,cfg,centre){
   };
 }
 function newPlayer(id,name,ch,host){
-  return {id:id,name:name,char:ch,host:!!host,role:'hider',caught:false,convertAt:null,
+  return {id:id,name:name,char:ch,host:!!host,role:'hider',caught:false,convertAt:null,wantsSeek:false,
     lat:null,lng:null,locT:0,outsideSince:null,exposedUntil:0,seen:0,
     stats:{catches:0,missions:0,leaks:0,votes:0,exposed:0,dist:0,survived:0},lastAct:0};
 }
@@ -1628,6 +1647,7 @@ function applyAction(st,pid,a){
     pushEvent(st,'seekers','tip','SECRET TIP',body);
     pushEvent(st,pid,'tipsent','TIP SENT','The seekers have no idea it came from you.');
   }
+  if(a.type==='volunteer'&&st.phase==='LOBBY') p.wantsSeek=!!a.data;
   if(a.type==='start'&&pid===st.hostId&&st.phase==='LOBBY') startMatch(st);
   if(a.type==='pause'&&pid===st.hostId&&st.phase!=='LOBBY'&&st.phase!=='RESULTS'&&!st.pausedAt){
     st.pausedAt=now();
@@ -1646,7 +1666,7 @@ function applyAction(st,pid,a){
 function startMatch(st){
   var ids=Object.keys(st.players);
   if(ids.length<2){ toast('Need at least 2 players'); return; }
-  var r=assignRoles(ids,mulberry32(st.seed),st.cfg.imposters);
+  var r=assignRoles(ids,mulberry32(st.seed),st.cfg.imposters,volunteerIds(st.players));
   ids.forEach(function(id){ st.players[id].role=r.roles[id]; });
   st.imposterId=r.imposterId; st.imposterEligible=!!r.imposterId;
   st.phase='SCATTER'; st.t0=now(); st._last=now();
@@ -2359,10 +2379,13 @@ function drawQR(cv,text){
 
 /* ---------- lobby ---------- */
 function presenceLabel(p,st){
+  var pr=p.bot?'live':presence(p,now());
+  if(pr==='stale') return 'signal weak';
+  if(pr==='lost') return 'signal lost';
+  if(p.wantsSeek) return 'wants to seek';
   if(p.bot) return 'bot';
   if(p.host) return 'host';
-  var pr=presence(p,now());
-  return pr==='live'?'ready':pr==='stale'?'signal weak':'signal lost';
+  return 'ready';
 }
 function renderLobby(){
   var st=G.st; if(!st) return;
@@ -2373,7 +2396,8 @@ function renderLobby(){
   ids.forEach(function(id){
     var p=st.players[id], pr=p.bot?'live':presence(p,now());
     var d=document.createElement('div');
-    d.className='rcell'+(p.host?' host':'')+(pr==='stale'?' stale':pr==='lost'?' lost':'');
+    d.className='rcell'+(p.host?' host':'')+(p.wantsSeek?' seeking':'')+
+      (pr==='stale'?' stale':pr==='lost'?' lost':'');
     var c=document.createElement('canvas'); c.width=40;c.height=52; d.appendChild(c);
     var b=document.createElement('b'); b.textContent=p.name; d.appendChild(b);
     var i=document.createElement('i'); i.textContent=presenceLabel(p,st); d.appendChild(i);
@@ -2389,11 +2413,21 @@ function renderLobby(){
       $('#lobbyQRWrap').classList.toggle('hidden',!ok2);
     }
   }
+  var vols=volunteerIds(st.players), mineP=st.players[G.me.id];
+  var vb=$('#b-volunteer');
+  if(vb){
+    var up=!!(mineP&&mineP.wantsSeek);
+    vb.textContent=up?'You put your hand up — tap to take it back':"I'll be the seeker";
+    vb.classList.toggle('dark',!up);
+  }
   $('#b-start').classList.toggle('hidden',!G.isHost);
   var lr=$('#lobbyRules'); if(lr&&st.cfg) lr.textContent=rulesSummary(st.cfg);
-  $('#lobbyHint').textContent=G.isHost
-    ? (ids.length<3?'You need at least 3 players for an imposter. Add bots from the DEV tab to test alone.':'Everyone in? Start when ready.')
-    : 'Waiting for the host to start…';
+  var whoSeeks=vols.length===0?'Nobody has volunteered — the seeker will be picked at random.'
+    :vols.length===1?(st.players[vols[0]].name+' has volunteered to seek.')
+    :(vols.length+' people volunteered — one of them will be picked at random.');
+  $('#lobbyHint').textContent=(G.isHost
+    ? (ids.length<3?'You need at least 3 players for an imposter. ':'Everyone in? Start when ready. ')
+    : 'Waiting for the host to start… ')+whoSeeks;
   var ln=$('#lobbyNet');
   if(ln){
     var ns=netStatus();
@@ -3562,6 +3596,12 @@ function boot(){
     var c=($('#codeInput').value||'').trim().toUpperCase();
     if(c.length<4){ $('#joinMsg').textContent='Enter the 5-character code.'; return; }
     joinGame(c);
+  };
+  $('#b-volunteer').onclick=function(){
+    var p=G.st&&G.st.players[G.me.id]; if(!p) return;
+    SFX.tap(); act('volunteer',!p.wantsSeek);
+    if(!G.isHost) p.wantsSeek=!p.wantsSeek;      // show it immediately, the host confirms
+    renderLobby();
   };
   $('#b-start').onclick=function(){ SFX.ok(); act('start'); };
   $('#b-leave').onclick=function(){ leaveRoom(); show('s-home'); };

@@ -1003,6 +1003,61 @@ t('hiders seeing each other never leaks who the imposter is',()=>{
   const asImp=withSight(1,()=>C.sees(vHider,{id:'i1',role:'imposter'},room(),0));
   return eq(asHider,asImp);});
 
+/* ---- volunteering to seek ---- */
+const IDS=['a','b','c','d','e'];
+t('with nobody volunteering the seeker is still drawn at random',()=>{
+  const seen={};
+  for(let i=0;i<80;i++) seen[C.assignRoles(IDS,C.mulberry32(i),1).seekerId]=1;
+  return ok(Object.keys(seen).length>=4,'only '+Object.keys(seen).length+' different seekers');});
+t('a single volunteer gets the job every time',()=>{
+  for(let i=0;i<40;i++){
+    const r=C.assignRoles(IDS,C.mulberry32(i),1,['d']);
+    if(r.seekerId!=='d') throw new Error('seed '+i+' gave it to '+r.seekerId);
+  }
+  return true;});
+t('the volunteer is actually marked as the seeker, not just named',()=>{
+  const r=C.assignRoles(IDS,C.mulberry32(7),1,['d']);
+  return eq(r.roles.d,'seeker');});
+t('several volunteers and the draw picks between them',()=>{
+  const seen={};
+  for(let i=0;i<80;i++){
+    const r=C.assignRoles(IDS,C.mulberry32(i),1,['b','d']);
+    if(r.seekerId!=='b'&&r.seekerId!=='d') throw new Error('picked a non-volunteer: '+r.seekerId);
+    seen[r.seekerId]=1;
+  }
+  return eq(Object.keys(seen).length,2,'both volunteers should come up:');});
+t('everyone volunteering is the same as nobody volunteering',()=>{
+  const seen={};
+  for(let i=0;i<80;i++) seen[C.assignRoles(IDS,C.mulberry32(i),1,IDS).seekerId]=1;
+  return ok(Object.keys(seen).length>=4);});
+t('a volunteer who misses out can still draw the imposter',()=>{
+  let asImp=false;
+  for(let i=0;i<80;i++){
+    const r=C.assignRoles(IDS,C.mulberry32(i),1,['b','d']);
+    if(r.imposterId==='b'||r.imposterId==='d') asImp=true;
+  }
+  return ok(asImp,'a spare volunteer never drew the imposter');});
+t('the imposter is never also the seeker',()=>{
+  for(let i=0;i<80;i++){
+    const r=C.assignRoles(IDS,C.mulberry32(i),1,['c']);
+    if(r.imposterId===r.seekerId) throw new Error('same player got both at seed '+i);
+  }
+  return true;});
+t('there is still exactly one seeker',()=>{
+  const r=C.assignRoles(IDS,C.mulberry32(3),1,['a','b','c']);
+  const n=Object.keys(r.roles).filter(k=>r.roles[k]==='seeker').length;
+  return eq(n,1);});
+t('a volunteer who left the lobby is ignored',()=>{
+  const r=C.assignRoles(IDS,C.mulberry32(5),1,['zz']);
+  return ok(IDS.indexOf(r.seekerId)>=0);});
+t('bots cannot volunteer on your behalf',()=>{
+  const players={a:{wantsSeek:true},bot1:{wantsSeek:true,bot:true},c:{}};
+  return eq(C.volunteerIds(players).join(','),'a');});
+t('nobody putting their hand up reads as an empty list, not undefined',()=>
+  eq(C.volunteerIds({a:{},b:{}}).length,0));
+t('a room with no players at all does not crash the draw',()=>
+  eq(C.volunteerIds(null).length,0));
+
 /* ---- the imposter's missions ---- */
 const missionRoom=(m,players)=>({mission:m,players:players||{},imposterId:'i1',imposterEligible:true});
 t('a lure mission points at the spot itself',()=>{

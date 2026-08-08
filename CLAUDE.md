@@ -20,7 +20,7 @@ src/shell.html   markup + all CSS. Contains one empty <script>\n</script> block.
 src/game.js      the entire game, one IIFE.
 build.js         inlines game.js into shell.html -> index.html. No bundler, no deps.
 index.html       BUILT ARTIFACT — never edit by hand, it is overwritten.
-test/harness.js  303 pure-logic tests, no DOM. Runs in ~1s.
+test/harness.js  315 pure-logic tests, no DOM. Runs in ~1s.
 test/smoke*.js   7 jsdom runs that boot the real built file and drive the UI.
                  smoke7 is the important one: two windows, one fake Supabase, a whole
                  networked match including a rejoin and a dropped phone.
@@ -121,7 +121,7 @@ Break any of these and the game stops making sense:
 
 ## Current state
 
-Working: a scannable QR join code, low-power screen, seeker-proximity warning,
+Working: volunteering to seek in the lobby, a scannable QR join code, low-power screen, seeker-proximity warning,
 host pause/resume and end-early, host migration, a wake lock that survives
 backgrounding, on-map guidance to the safe zone, profile and 12 procedural characters, room-code lobby over Supabase with a shareable
 join link, mid-match rejoin, dropped-phone handling, roles, scatter, real-street map with a
@@ -193,7 +193,7 @@ Known limits, in the order they'll hurt:
 ```
 npm install        once, for jsdom
 npm run build      src -> index.html
-npm test           303 core tests + 7 smoke runs
+npm test           315 core tests + 7 smoke runs
 npm run serve      localhost:8080 — geolocation works on localhost, unlike file://
 ```
 
