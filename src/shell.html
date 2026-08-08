@@ -122,11 +122,15 @@ input:focus{outline:none;border-color:var(--accent)}
 .rcell.lost i{color:var(--ember)}
 
 /* multiplayer setup */
+/* body sets user-select:none for the game; these have to opt back in, and iOS only
+   honours the -webkit- form — without it the block cannot be selected by hand at all */
 .sqlbox{background:var(--deep);color:#6ee7c0;font:10px/1.45 ui-monospace,Menlo,monospace;
-  padding:10px;margin:6px 0 0;white-space:pre;overflow-x:auto;user-select:all;
+  padding:10px;margin:6px 0 0;white-space:pre;overflow:auto;max-height:200px;
+  -webkit-user-select:all;user-select:all;
   box-shadow:inset 0 0 0 2px #ffffff14}
 .linkbox{background:var(--deep);font:11px/1.4 ui-monospace,Menlo,monospace;color:var(--cream);
-  padding:10px;margin:6px 0 8px;word-break:break-all;user-select:all;
+  padding:10px;margin:6px 0 8px;word-break:break-all;
+  -webkit-user-select:all;user-select:all;
   box-shadow:inset 0 0 0 2px #ffffff14}
 
 /* ---------- match view ---------- */
@@ -330,9 +334,13 @@ input:focus{outline:none;border-color:var(--accent)}
     <div class="panel">
       <div class="tiny">Step 2 — make the tables</div>
       <p style="margin:6px 0 0;font-size:12px">In your project, click <b>SQL Editor</b> in the left
-      sidebar, then <b>New query</b>. Copy everything in the black box below, paste it in, and press
+      sidebar, then <b>New query</b>. Press the button below, paste into the big empty box, and hit
       <b>Run</b>. You should see “Success. No rows returned” — that is what success looks like here.</p>
+      <button class="btn dark small" id="b-copy-sql" style="margin-top:8px">Copy the SQL</button>
+      <p id="mpSqlMsg" class="tiny" style="min-height:14px;margin:6px 0 0;text-align:center"></p>
       <pre id="mpSql" class="sqlbox"></pre>
+      <p style="margin:8px 0 0;font-size:11px;color:var(--dim)">If the button will not copy on your
+      phone, open <b>supabase.sql</b> in the game’s GitHub repo on a laptop and copy it there.</p>
     </div>
 
     <div class="panel">

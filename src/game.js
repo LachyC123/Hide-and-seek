@@ -2038,8 +2038,35 @@ function openTipMenu(){
     return {label:o.t,fn:function(){ act('tip',o.k); SFX.ok(); }};
   }));
 }
+/* Copying a long block from a phone is the step people actually get stuck on.
+   The clipboard API is blocked in plenty of contexts (frames, older iOS, http),
+   and it fails by rejecting a promise — silently, unless you say something.
+   Three ways, in order, and an honest message if none of them work. */
+function copyText(text,node,done){
+  done=done||function(m){ toast(m); };
+  var viaSelection=function(){
+    if(!node||!window.getSelection||!document.createRange) return false;
+    try{
+      var r=document.createRange(); r.selectNodeContents(node);
+      var s=window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      var good=false;
+      try{ good=!!(document.execCommand&&document.execCommand('copy')); }catch(e){}
+      if(good){ s.removeAllRanges(); done('Copied'); }
+      else done('Selected it for you — now use your browser’s Copy');
+      return true;                       // left selected on purpose if the copy failed
+    }catch(e){ return false; }
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){ done('Copied'); },function(){
+      if(!viaSelection()) done('Could not copy — long-press the text to select it');
+    });
+    return;
+  }
+  if(!viaSelection()) done('Could not copy — long-press the text to select it');
+}
 function modal(title,body,buttons){
   var d=document.createElement('div');
+  d.className='modal';
   d.style.cssText='position:fixed;inset:0;z-index:95;background:#0b0916f2;display:flex;flex-direction:column;justify-content:center;padding:26px;text-align:center';
   var h=document.createElement('h1'); h.textContent=title; h.style.fontSize='24px'; d.appendChild(h);
   var p=document.createElement('p'); p.textContent=body; d.appendChild(p);
@@ -2854,13 +2881,14 @@ function boot(){
   $('#b-mp-save').onclick=function(){ SFX.tap(); saveMp(); };
   $('#b-mp-clear').onclick=function(){ G.mp=mpFallback(null); $('#mpUrl').value=''; $('#mpKey').value='';
     $('#mpMsg').textContent=''; netRefresh(); saveProfile(); SFX.tap(); renderMpScreen(); };
-  $('#b-copy-link').onclick=function(){
-    var t=G.joinLink||''; SFX.tap();
-    if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(t).then(function(){toast('Join link copied');},
-        function(){toast('Copy failed — long-press the link to select it');});
-    } else toast('Long-press the link to select and copy it');
-  };
+  $('#b-copy-link').onclick=function(){ SFX.tap();
+    copyText(G.joinLink||'',$('#lobbyLink')); };
+  $('#b-copy-sql').onclick=function(){ SFX.tap();
+    var msg=$('#mpSqlMsg');
+    copyText(MP_SQL,$('#mpSql'),function(m){
+      msg.textContent=m;
+      msg.style.color=/^Copied/.test(m)?'var(--moss)':'var(--amber)';
+    }); };
   $('#b-solo').onclick=function(){ SFX.ok(); G.cfg.matchLen=1200; G.cfg.scatter=60; createGame(true); };
   $$('[data-back]').forEach(function(b){ b.onclick=function(){ SFX.tap(); show(b.getAttribute('data-back')); }; });
   $('#b-create-go').onclick=function(){ SFX.ok(); createGame(false); };
